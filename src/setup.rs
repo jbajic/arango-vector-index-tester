@@ -6,7 +6,8 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::Uniform;
 use rayon::prelude::*;
 use serde_json::{json, Value};
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -15,17 +16,38 @@ use crate::SetupArgs;
 
 const DEFAULT_RANDOM_NDOCS: usize = 200_000;
 
+const ANN_BENCHMARKS_BASE_URL: &str = "http://ann-benchmarks.com";
+
+const KNOWN_DATASETS: &[&str] = &[
+    "deep-image-96-angular",
+    "fashion-mnist-784-euclidean",
+    "gist-960-euclidean",
+    "glove-25-angular",
+    "glove-50-angular",
+    "glove-100-angular",
+    "glove-200-angular",
+    "lastfm-64-dot",
+    "mnist-784-euclidean",
+    "nytimes-16-angular",
+    "nytimes-256-angular",
+    "sift-128-euclidean",
+];
+
 struct Inserted {
     dim: usize,
     ndocs: usize,
 }
 
-pub fn run(client: &Client, db: &str, coll: &str, args: SetupArgs) -> Result<()> {
+pub fn run(client: &Client, db: &str, coll: &str, mut args: SetupArgs) -> Result<()> {
+    if let Some(ref name) = args.ann_dataset.clone() {
+        args.input = Some(ensure_dataset(name)?);
+    }
+
     print_banner(&args, db, coll);
 
     // Validate the HDF5 input before any destructive op on the database.
     if let Some(path) = args.input.as_deref() {
-        validate_hdf5(path, &args.dataset)?;
+        validate_hdf5(path, "train")?;
     }
 
     println!("Dropping (if exists) and creating database '{}'...", db);
@@ -46,13 +68,84 @@ pub fn run(client: &Client, db: &str, coll: &str, args: SetupArgs) -> Result<()>
     Ok(())
 }
 
+fn dataset_cache_dir() -> Result<PathBuf> {
+    let home = std::env::var("HOME").context("HOME env var not set")?;
+    Ok(PathBuf::from(home).join("dataset-embeddings"))
+}
+
+fn ensure_dataset(name: &str) -> Result<PathBuf> {
+    if !KNOWN_DATASETS.contains(&name) {
+        bail!(
+            "Unknown ann-benchmarks dataset '{}'. Known datasets:\n  {}",
+            name,
+            KNOWN_DATASETS.join("\n  ")
+        );
+    }
+    let cache_dir = dataset_cache_dir()?;
+    let dest = cache_dir.join(format!("{}.hdf5", name));
+    if dest.exists() {
+        println!("Using cached dataset: {}", dest.display());
+        return Ok(dest);
+    }
+    std::fs::create_dir_all(&cache_dir)
+        .with_context(|| format!("creating cache dir {}", cache_dir.display()))?;
+    let url = format!("{}/{}.hdf5", ANN_BENCHMARKS_BASE_URL, name);
+    println!("Downloading {} -> {}", url, dest.display());
+    download_dataset(&url, &dest)?;
+    Ok(dest)
+}
+
+fn download_dataset(url: &str, dest: &Path) -> Result<()> {
+    let response = reqwest::blocking::get(url).with_context(|| format!("GET {}", url))?;
+    if !response.status().is_success() {
+        bail!("HTTP {} downloading {}", response.status(), url);
+    }
+    let total = response.content_length();
+    let pb = match total {
+        Some(len) => {
+            let pb = ProgressBar::new(len);
+            pb.set_style(
+                ProgressStyle::with_template(
+                    "{spinner} [{elapsed_precise}] {bar:40} {bytes}/{total_bytes} ({bytes_per_sec}, eta {eta})",
+                )
+                .unwrap(),
+            );
+            pb
+        }
+        None => {
+            let pb = ProgressBar::new_spinner();
+            pb.set_style(
+                ProgressStyle::with_template(
+                    "{spinner} [{elapsed_precise}] {bytes} downloaded ({bytes_per_sec})",
+                )
+                .unwrap(),
+            );
+            pb
+        }
+    };
+    let tmp = dest.with_extension("hdf5.tmp");
+    let mut file =
+        std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    let mut reader = pb.wrap_read(response);
+    io::copy(&mut reader, &mut file).with_context(|| format!("writing to {}", tmp.display()))?;
+    pb.finish_and_clear();
+    std::fs::rename(&tmp, dest)
+        .with_context(|| format!("renaming {} -> {}", tmp.display(), dest.display()))?;
+    println!(
+        "Downloaded {} ({:.1} MB).",
+        dest.display(),
+        dest.metadata().map(|m| m.len()).unwrap_or(0) as f64 / 1e6
+    );
+    Ok(())
+}
+
 fn print_banner(args: &SetupArgs, db: &str, coll: &str) {
     let nlists_str = args
         .nlists
         .map(|n| n.to_string())
         .unwrap_or_else(|| "auto".to_string());
     let source = match &args.input {
-        Some(p) => format!("HDF5 file {} (dataset '{}')", p.display(), args.dataset),
+        Some(p) => format!("HDF5 file {}", p.display()),
         None => format!(
             "random uniform[-1, 1] (seed={}, dim={})",
             args.seed, args.dim
@@ -71,12 +164,18 @@ fn print_banner(args: &SetupArgs, db: &str, coll: &str) {
     println!("  1. Drop (if exists) and recreate database '{}'", db);
     println!("  2. Create collection '{}' (shards={})", coll, args.shards);
     println!("  3. Insert {} from {}", count_str, source);
-    println!("     - {} parallel workers, batch={}", args.workers, args.batch);
+    println!(
+        "     - {} parallel workers, batch={}",
+        args.workers, args.batch
+    );
     println!("     - each doc: {{ idx: <row>, vector: [...] }}");
     println!("  4. Build vector index 'vector_cosine':");
     println!("     - type=vector, metric=cosine");
-    println!("     - nLists={}, trainingIterations={}", nlists_str, args.train_iters);
-    println!("     - waits up to {}s for ready state", args.index_timeout_sec);
+    println!("     - nLists={}, trainingIterations={}", nlists_str, 25);
+    println!(
+        "     - waits up to {}s for ready state",
+        args.index_timeout_sec
+    );
     println!();
 }
 
@@ -119,12 +218,15 @@ fn insert_random(client: &Client, db: &str, coll: &str, args: &SetupArgs) -> Res
         elapsed.as_secs_f64(),
         ndocs as f64 / elapsed.as_secs_f64()
     );
-    Ok(Inserted { dim: args.dim, ndocs })
+    Ok(Inserted {
+        dim: args.dim,
+        ndocs,
+    })
 }
 
 fn validate_hdf5(path: &Path, dataset_name: &str) -> Result<()> {
-    let file = hdf5::File::open(path)
-        .with_context(|| format!("opening HDF5 file {}", path.display()))?;
+    let file =
+        hdf5::File::open(path).with_context(|| format!("opening HDF5 file {}", path.display()))?;
     let ds = file
         .dataset(dataset_name)
         .with_context(|| format!("opening dataset '{}'", dataset_name))?;
@@ -149,19 +251,19 @@ fn insert_from_hdf5(
     println!(
         "Reading HDF5 file {} (dataset '{}')...",
         path.display(),
-        args.dataset
+        "train"
     );
     let t_read = Instant::now();
-    let file = hdf5::File::open(path)
-        .with_context(|| format!("opening HDF5 file {}", path.display()))?;
+    let file =
+        hdf5::File::open(path).with_context(|| format!("opening HDF5 file {}", path.display()))?;
     let ds = file
-        .dataset(&args.dataset)
-        .with_context(|| format!("opening dataset '{}'", args.dataset))?;
+        .dataset(&"train")
+        .with_context(|| format!("opening dataset '{}'", "train"))?;
     let shape = ds.shape();
     if shape.len() != 2 {
         bail!(
             "dataset '{}' is {}D, expected 2D (rows × dim)",
-            args.dataset,
+            "train",
             shape.len()
         );
     }
@@ -178,7 +280,7 @@ fn insert_from_hdf5(
 
     let data: Array2<f32> = ds
         .read_slice_2d(s![..n, ..])
-        .with_context(|| format!("reading first {} rows of dataset '{}'", n, args.dataset))?;
+        .with_context(|| format!("reading first {} rows of dataset '{}'", n, "train"))?;
     let read_elapsed = t_read.elapsed();
     println!(
         "  loaded {:.1} MB in {:.1}s",
@@ -271,13 +373,13 @@ fn create_cosine_index(
         .unwrap_or_else(|| "auto".to_string());
     println!(
         "Creating cosine vector index (dim={}, nLists={}, trainingIterations={})...",
-        dim, nlists_label, args.train_iters
+        dim, nlists_label, 25
     );
     let start = Instant::now();
     let mut params = json!({
         "metric": "cosine",
         "dimension": dim,
-        "trainingIterations": args.train_iters,
+        "trainingIterations": 25,
     });
     if let Some(n) = args.nlists {
         params["nLists"] = json!(n);
@@ -318,9 +420,18 @@ fn print_index_stats(client: &Client, db: &str, coll: &str) -> Result<()> {
         .or_else(|| params["nLists"].as_u64());
 
     println!("Vector index stats:");
-    println!("  name:               {}", idx["name"].as_str().unwrap_or("?"));
-    println!("  metric:             {}", params["metric"].as_str().unwrap_or("?"));
-    println!("  dimension:          {}", params["dimension"].as_u64().unwrap_or(0));
+    println!(
+        "  name:               {}",
+        idx["name"].as_str().unwrap_or("?")
+    );
+    println!(
+        "  metric:             {}",
+        params["metric"].as_str().unwrap_or("?")
+    );
+    println!(
+        "  dimension:          {}",
+        params["dimension"].as_u64().unwrap_or(0)
+    );
     if let Some(n) = user_nlists {
         println!("  nLists (requested): {}", n);
     } else {

@@ -7,10 +7,18 @@ mod client;
 mod setup;
 
 #[derive(Parser)]
-#[command(name = "vrecall", about = "ArangoDB cosine vector-index recall benchmark")]
+#[command(
+    name = "vrecall",
+    about = "ArangoDB cosine vector-index recall benchmark"
+)]
 struct Cli {
     /// ArangoDB endpoint (HTTP URL).
-    #[arg(long, env = "VRECALL_ENDPOINT", default_value = "http://127.0.0.1:8529", global = true)]
+    #[arg(
+        long,
+        env = "VRECALL_ENDPOINT",
+        default_value = "http://127.0.0.1:8529",
+        global = true
+    )]
     endpoint: String,
 
     /// Username.
@@ -22,11 +30,21 @@ struct Cli {
     password: String,
 
     /// Database name.
-    #[arg(long, env = "VRECALL_DB", default_value = "vectorRecallDb", global = true)]
+    #[arg(
+        long,
+        env = "VRECALL_DB",
+        default_value = "vectorRecallDb",
+        global = true
+    )]
     db: String,
 
     /// Collection name.
-    #[arg(long, env = "VRECALL_COLL", default_value = "vectorColl", global = true)]
+    #[arg(
+        long,
+        env = "VRECALL_COLL",
+        default_value = "vectorColl",
+        global = true
+    )]
     coll: String,
 
     #[command(subcommand)]
@@ -43,15 +61,14 @@ enum Cmd {
 
 #[derive(Args)]
 pub struct SetupArgs {
-    /// HDF5 file with vectors (e.g. ann-benchmarks glove-100-angular.hdf5).
-    /// When set, --dim and --seed are ignored; dim and contents come from
-    /// the file. The whole dataset is loaded into RAM.
-    #[arg(long)]
+    // Resolved HDF5 path; populated at runtime from --ann-dataset, never set by the user.
+    #[arg(skip)]
     pub input: Option<PathBuf>,
 
-    /// Dataset name within the HDF5 file (only meaningful with --input).
-    #[arg(long, default_value = "train")]
-    pub dataset: String,
+    /// Named ann-benchmarks dataset to download automatically (e.g. glove-100-angular).
+    /// The file is cached in ~/dataset-embeddings/ and reused on subsequent runs.
+    #[arg(long)]
+    pub ann_dataset: Option<String>,
 
     /// Vector dimension (random mode only; ignored with --input).
     #[arg(long, default_value_t = 768)]
@@ -67,10 +84,6 @@ pub struct SetupArgs {
     #[arg(long)]
     pub nlists: Option<u64>,
 
-    /// Training iterations.
-    #[arg(long, default_value_t = 25)]
-    pub train_iters: u64,
-
     /// Number of shards on the dataset collection.
     #[arg(long, default_value_t = 3)]
     pub shards: u64,
@@ -84,7 +97,7 @@ pub struct SetupArgs {
     pub batch: usize,
 
     /// Parallel HTTP insert workers.
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 16)]
     pub workers: usize,
 
     /// How long to wait for the index to reach the ready state, in seconds.
@@ -132,7 +145,7 @@ pub struct BenchArgs {
 
     /// Parallel workers for the ground-truth pass (collection mode only).
     /// The approx sweep stays serial so per-query timings are meaningful.
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 16)]
     pub gt_workers: usize,
 
     /// Name of the vector index to use. When omitted the first vector index

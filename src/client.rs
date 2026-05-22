@@ -52,9 +52,7 @@ impl Client {
         if let Some(b) = body {
             req = req.json(b);
         }
-        let resp = req
-            .send()
-            .with_context(|| format!("{} {}", method, url))?;
+        let resp = req.send().with_context(|| format!("{} {}", method, url))?;
         let status = resp.status();
         let text = resp
             .text()

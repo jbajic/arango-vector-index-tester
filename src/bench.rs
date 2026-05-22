@@ -62,11 +62,19 @@ pub fn run(client: &Client, db: &str, coll: &str, args: BenchArgs) -> Result<()>
         .context("could not determine dimension from index definition")?;
     let count = client.collection_count(db, coll)?;
 
-    let mut nprobes: Vec<u64> = args.nprobes.iter().copied().filter(|p| *p <= nlists).collect();
+    let mut nprobes: Vec<u64> = args
+        .nprobes
+        .iter()
+        .copied()
+        .filter(|p| *p <= nlists)
+        .collect();
     nprobes.sort_unstable();
     nprobes.dedup();
     if nprobes.is_empty() {
-        bail!("no nProbe values remain after clamping to nLists={}", nlists);
+        bail!(
+            "no nProbe values remain after clamping to nLists={}",
+            nlists
+        );
     }
 
     let mut ks: Vec<usize> = args.topk.clone();
@@ -74,9 +82,27 @@ pub fn run(client: &Client, db: &str, coll: &str, args: BenchArgs) -> Result<()>
     ks.dedup();
     let max_k = *ks.last().context("--topk is empty")?;
 
-    print_banner(&args, db, coll, count, dimension, nlists, &index_name, &ks, &nprobes);
+    print_banner(
+        &args,
+        db,
+        coll,
+        count,
+        dimension,
+        nlists,
+        &index_name,
+        &ks,
+        &nprobes,
+    );
     let sample_nprobe = *nprobes.first().unwrap();
-    print_sample_query_and_plan(client, db, coll, dimension as usize, max_k, sample_nprobe, &index_name)?;
+    print_sample_query_and_plan(
+        client,
+        db,
+        coll,
+        dimension as usize,
+        max_k,
+        sample_nprobe,
+        &index_name,
+    )?;
 
     let queries: Vec<Query> = if let Some(path) = args.gt_file.as_deref() {
         load_gt_from_hdf5(path, &args, max_k)?
@@ -91,7 +117,8 @@ pub fn run(client: &Client, db: &str, coll: &str, args: BenchArgs) -> Result<()>
         let per_query: Result<Vec<(Vec<f64>, Vec<Option<f64>>)>> = queries
             .iter()
             .map(|q| {
-                let approx = run_approx_topk(client, db, coll, &q.vector, max_k, nprobe, &index_name)?;
+                let approx =
+                    run_approx_topk(client, db, coll, &q.vector, max_k, nprobe, &index_name)?;
                 let recall: Vec<f64> = ks
                     .iter()
                     .map(|&k| recall_at_k(&q.truth, &approx, k))
@@ -183,18 +210,22 @@ fn print_sample_query_and_plan(
         "FOR d IN {} OPTIONS {{indexHint: \"{}\", forceIndexHint: true}} LET sim = APPROX_NEAR_COSINE(d.vector, @qp, {{nProbe: {}}}) SORT sim DESC LIMIT {} RETURN {{k: d.idx, s: sim}}",
         _coll, index_name, sample_nprobe, max_k
     );
-    println!("Sample approx query (nProbe={}, LIMIT={}):", sample_nprobe, max_k);
+    println!(
+        "Sample approx query (nProbe={}, LIMIT={}):",
+        sample_nprobe, max_k
+    );
     println!("  {}", q);
     println!();
 
     let qp: Vec<f32> = vec![0.0; dim];
-    let bind_vars = serde_json::to_string(&json!({ "qp": qp }))
-        .context("serializing bindVars")?;
+    let bind_vars = serde_json::to_string(&json!({ "qp": qp })).context("serializing bindVars")?;
     match run_arangosh_explain(client, db, &q, &bind_vars) {
         Ok(()) => {}
         Err(e) => {
             println!("(could not run arangosh explainer: {e})");
-            println!("  hint: ensure `arangosh` is on PATH, or pass VRECALL_ARANGOSH=/path/to/arangosh");
+            println!(
+                "  hint: ensure `arangosh` is on PATH, or pass VRECALL_ARANGOSH=/path/to/arangosh"
+            );
             println!();
         }
     }
@@ -212,8 +243,7 @@ fn run_arangosh_explain(
 ) -> Result<()> {
     use std::process::{Command, Stdio};
 
-    let arangosh_bin =
-        std::env::var("VRECALL_ARANGOSH").unwrap_or_else(|_| "arangosh".to_string());
+    let arangosh_bin = std::env::var("VRECALL_ARANGOSH").unwrap_or_else(|_| "arangosh".to_string());
 
     let script = "\
         const internal = require('internal');\
@@ -260,7 +290,10 @@ fn compute_gt_from_collection(
     args: &BenchArgs,
     max_k: usize,
 ) -> Result<Vec<Query>> {
-    println!("\nSampling {} query vectors from collection...", args.queries);
+    println!(
+        "\nSampling {} query vectors from collection...",
+        args.queries
+    );
     let query_vectors = sample_queries(client, db, coll, args.queries)?;
     println!("Got {} query vectors.", query_vectors.len());
 
@@ -277,7 +310,10 @@ fn compute_gt_from_collection(
             .into_par_iter()
             .map(|vector| {
                 let topk = run_exact_topk(client, db, coll, &vector, max_k)?;
-                let truth = topk.into_iter().map(|(idx, sim)| (idx, Some(sim))).collect();
+                let truth = topk
+                    .into_iter()
+                    .map(|(idx, sim)| (idx, Some(sim)))
+                    .collect();
                 Ok(Query { vector, truth })
             })
             .collect()
@@ -293,8 +329,7 @@ fn compute_gt_from_collection(
 
 fn load_gt_from_hdf5(path: &Path, args: &BenchArgs, max_k: usize) -> Result<Vec<Query>> {
     println!("\nReading ground truth from {} ...", path.display());
-    let file = hdf5::File::open(path)
-        .with_context(|| format!("opening {}", path.display()))?;
+    let file = hdf5::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let test_ds = file
         .dataset(&args.gt_test)
         .with_context(|| format!("opening dataset '{}'", args.gt_test))?;
@@ -344,10 +379,7 @@ fn load_gt_from_hdf5(path: &Path, args: &BenchArgs, max_k: usize) -> Result<Vec<
         Ok(ds) => {
             let shape = ds.shape();
             if shape.len() != 2 || shape[0] != test_shape[0] || shape[1] != truth_k {
-                println!(
-                    "  distances: shape mismatch ({:?}), ignoring",
-                    shape
-                );
+                println!("  distances: shape mismatch ({:?}), ignoring", shape);
                 None
             } else {
                 Some(ds.read_slice_2d(s![..n_queries, ..max_k])?)
@@ -376,7 +408,11 @@ fn load_gt_from_hdf5(path: &Path, args: &BenchArgs, max_k: usize) -> Result<Vec<
             .collect();
         queries.push(Query { vector, truth });
     }
-    println!("Loaded {} queries with top-{} ground truth.", queries.len(), max_k);
+    println!(
+        "Loaded {} queries with top-{} ground truth.",
+        queries.len(),
+        max_k
+    );
     Ok(queries)
 }
 
@@ -394,18 +430,16 @@ fn angular_dist_to_cos_sim(d: f32) -> f32 {
     1.0 - d
 }
 
-fn sample_queries(
-    client: &Client,
-    db: &str,
-    coll: &str,
-    n: usize,
-) -> Result<Vec<Vec<f32>>> {
+fn sample_queries(client: &Client, db: &str, coll: &str, n: usize) -> Result<Vec<Vec<f32>>> {
     let query = format!("FOR d IN {coll} SORT d.idx LIMIT {n} RETURN d.vector");
     let rows = client.aql(db, &query, json!({}))?;
     rows.into_iter()
         .map(|r| {
             let arr = r.as_array().context("query vector is not an array")?;
-            Ok(arr.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect())
+            Ok(arr
+                .iter()
+                .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+                .collect())
         })
         .collect()
 }
@@ -457,11 +491,7 @@ fn extract_id_sims(rows: Vec<Value>) -> Result<Vec<(i64, f64)>> {
         .collect()
 }
 
-fn recall_at_k(
-    truth: &[(i64, Option<f64>)],
-    approx: &[(i64, f64)],
-    k: usize,
-) -> f64 {
+fn recall_at_k(truth: &[(i64, Option<f64>)], approx: &[(i64, f64)], k: usize) -> f64 {
     let truth_set: HashSet<i64> = truth.iter().take(k).map(|(id, _)| *id).collect();
     let hits = approx
         .iter()
@@ -479,11 +509,7 @@ fn recall_at_k(
 // Mean truth-sim minus mean approx-sim across the top-K. Returns None if
 // the ground-truth source didn't provide similarities (HDF5 without
 // `distances` array).
-fn sim_loss_at_k(
-    truth: &[(i64, Option<f64>)],
-    approx: &[(i64, f64)],
-    k: usize,
-) -> Option<f64> {
+fn sim_loss_at_k(truth: &[(i64, Option<f64>)], approx: &[(i64, f64)], k: usize) -> Option<f64> {
     let take = k.min(truth.len()).min(approx.len());
     if take == 0 {
         return None;

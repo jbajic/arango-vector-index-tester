@@ -10,7 +10,7 @@ measure recall@K and query throughput.
 - Rust toolchain (stable, 1.75+)
 - A running ArangoDB instance (≥ 3.12 with vector index support)
 - *(Optional)* `arangosh` on `PATH` for query plan output
-- *(Optional)* HDF5 dataset files from [ann-benchmarks](https://github.com/erikbern/ann-benchmarks)
+- *(Optional)* Internet access to download ann-benchmarks datasets (cached in `~/dataset-embeddings/`)
 
 ## Build
 
@@ -40,8 +40,8 @@ vrecall setup
 # Specific size / dimension
 vrecall setup --ndocs 500000 --dim 128
 
-# From an ann-benchmarks HDF5 file
-vrecall setup --input glove-100-angular.hdf5 --dataset train
+# Download a named ann-benchmarks dataset automatically (cached in ~/dataset-embeddings/)
+vrecall setup --ann-dataset glove-100-angular
 
 # Control index parameters
 vrecall setup --nlists 256 --train-iters 25 --shards 3
@@ -51,15 +51,13 @@ Key flags:
 
 | Flag                 | Default      | Description                                      |
 |----------------------|--------------|--------------------------------------------------|
-| `--input`            | —            | HDF5 file path; disables random mode             |
-| `--dataset`          | `train`      | Dataset name inside the HDF5 file                |
+| `--ann-dataset`      | —            | Named ann-benchmarks dataset to auto-download    |
 | `--dim`              | `768`        | Vector dimension (random mode only)              |
 | `--ndocs`            | `200000`     | Number of documents to insert                    |
 | `--nlists`           | auto         | IVF nLists (ArangoDB auto-selects when omitted)  |
-| `--train-iters`      | `25`         | K-means training iterations                      |
 | `--shards`           | `3`          | Collection shard count                           |
 | `--batch`            | `5000`       | Documents per HTTP insert batch                  |
-| `--workers`          | `8`          | Parallel insert workers                          |
+| `--workers`          | `16`         | Parallel insert workers                          |
 | `--index-timeout-sec`| `1800`       | Max seconds to wait for index ready state        |
 
 ### `bench` — measure recall and throughput
