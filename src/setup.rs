@@ -18,6 +18,24 @@ const DEFAULT_RANDOM_NDOCS: usize = 200_000;
 
 const ANN_BENCHMARKS_BASE_URL: &str = "http://ann-benchmarks.com";
 
+fn infer_metric(dataset_name: &str) -> &'static str {
+    if dataset_name.ends_with("-euclidean") {
+        "l2"
+    } else if dataset_name.ends_with("-dot") {
+        "dot"
+    } else {
+        "cosine"
+    }
+}
+
+fn index_name(metric: &str) -> &'static str {
+    match metric {
+        "l2" => "vector_l2",
+        "dot" => "vector_dot",
+        _ => "vector_cosine",
+    }
+}
+
 const KNOWN_DATASETS: &[&str] = &[
     "deep-image-96-angular",
     "fashion-mnist-784-euclidean",
@@ -39,11 +57,18 @@ struct Inserted {
 }
 
 pub fn run(client: &Client, db: &str, coll: &str, mut args: SetupArgs) -> Result<()> {
+    let metric = args
+        .ann_dataset
+        .as_deref()
+        .map(infer_metric)
+        .unwrap_or("cosine");
+    let idx_name = index_name(metric);
+
     if let Some(ref name) = args.ann_dataset.clone() {
         args.input = Some(ensure_dataset(name)?);
     }
 
-    print_banner(&args, db, coll);
+    print_banner(&args, db, coll, metric, idx_name);
 
     // Validate the HDF5 input before any destructive op on the database.
     if let Some(path) = args.input.as_deref() {
@@ -56,7 +81,7 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: SetupArgs) -> Result
     client.create_collection(db, coll, args.shards)?;
 
     let inserted = insert_dataset(client, db, coll, &args)?;
-    create_cosine_index(client, db, coll, &args, inserted.dim)?;
+    create_vector_index(client, db, coll, &args, inserted.dim, metric, idx_name)?;
     print_index_stats(client, db, coll)?;
 
     println!();
@@ -139,7 +164,7 @@ fn download_dataset(url: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-fn print_banner(args: &SetupArgs, db: &str, coll: &str) {
+fn print_banner(args: &SetupArgs, db: &str, coll: &str, metric: &str, idx_name: &str) {
     let nlists_str = args
         .nlists
         .map(|n| n.to_string())
@@ -169,8 +194,8 @@ fn print_banner(args: &SetupArgs, db: &str, coll: &str) {
         args.workers, args.batch
     );
     println!("     - each doc: {{ idx: <row>, vector: [...] }}");
-    println!("  4. Build vector index 'vector_cosine':");
-    println!("     - type=vector, metric=cosine");
+    println!("  4. Build vector index '{}':", idx_name);
+    println!("     - type=vector, metric={}", metric);
     println!("     - nLists={}, trainingIterations={}", nlists_str, 25);
     println!(
         "     - waits up to {}s for ready state",
@@ -360,24 +385,26 @@ fn make_batch_from_rows(data: &Array2<f32>, start: usize, end: usize) -> Value {
     Value::Array(docs)
 }
 
-fn create_cosine_index(
+fn create_vector_index(
     client: &Client,
     db: &str,
     coll: &str,
     args: &SetupArgs,
     dim: usize,
+    metric: &str,
+    idx_name: &str,
 ) -> Result<()> {
     let nlists_label = args
         .nlists
         .map(|n| n.to_string())
         .unwrap_or_else(|| "auto".to_string());
     println!(
-        "Creating cosine vector index (dim={}, nLists={}, trainingIterations={})...",
-        dim, nlists_label, 25
+        "Creating vector index '{}' (metric={}, dim={}, nLists={}, trainingIterations={})...",
+        idx_name, metric, dim, nlists_label, 25
     );
     let start = Instant::now();
     let mut params = json!({
-        "metric": "cosine",
+        "metric": metric,
         "dimension": dim,
         "trainingIterations": 25,
     });
@@ -385,7 +412,7 @@ fn create_cosine_index(
         params["nLists"] = json!(n);
     }
     let def = json!({
-        "name": "vector_cosine",
+        "name": idx_name,
         "type": "vector",
         "fields": ["vector"],
         "inBackground": false,
@@ -394,7 +421,7 @@ fn create_cosine_index(
     if let Err(e) = client.create_vector_index(db, coll, &def) {
         eprintln!("ensureIndex returned an error (will still poll for ready): {e}");
     }
-    wait_for_index_ready(client, db, coll, "vector_cosine", args.index_timeout_sec)?;
+    wait_for_index_ready(client, db, coll, idx_name, args.index_timeout_sec)?;
     println!("Index ready in {:.1}s.", start.elapsed().as_secs_f64());
     Ok(())
 }
