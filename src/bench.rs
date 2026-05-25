@@ -8,6 +8,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::client::Client;
+use crate::setup::ensure_dataset;
 use crate::BenchArgs;
 
 struct Query {
@@ -25,7 +26,10 @@ struct NProbeResult {
     avg_time_ms: f64,
 }
 
-pub fn run(client: &Client, db: &str, coll: &str, args: BenchArgs) -> Result<()> {
+pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result<()> {
+    if let Some(ref name) = args.ann_dataset.clone() {
+        args.gt_file = Some(ensure_dataset(name)?);
+    }
     if !client.database_exists(db)? {
         bail!("Database '{}' not found. Run `vrecall setup` first.", db);
     }
@@ -170,13 +174,7 @@ fn print_banner(
     nprobes: &[u64],
 ) {
     let truth_source = match &args.gt_file {
-        Some(p) => format!(
-            "HDF5 file {} (test='{}', neighbors='{}', distances='{}')",
-            p.display(),
-            args.gt_test,
-            args.gt_neighbors,
-            args.gt_distances
-        ),
+        Some(p) => format!("HDF5 file {}", p.display()),
         None => format!(
             "first {} docs of '{}' (brute-force COSINE_SIMILARITY, {} workers)",
             args.queries, coll, args.gt_workers
@@ -330,12 +328,10 @@ fn compute_gt_from_collection(
 fn load_gt_from_hdf5(path: &Path, args: &BenchArgs, max_k: usize) -> Result<Vec<Query>> {
     println!("\nReading ground truth from {} ...", path.display());
     let file = hdf5::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let test_ds = file
-        .dataset(&args.gt_test)
-        .with_context(|| format!("opening dataset '{}'", args.gt_test))?;
+    let test_ds = file.dataset("test").context("opening dataset 'test'")?;
     let nbrs_ds = file
-        .dataset(&args.gt_neighbors)
-        .with_context(|| format!("opening dataset '{}'", args.gt_neighbors))?;
+        .dataset("neighbors")
+        .context("opening dataset 'neighbors'")?;
 
     let test_shape = test_ds.shape();
     let nbrs_shape = nbrs_ds.shape();
@@ -352,9 +348,8 @@ fn load_gt_from_hdf5(path: &Path, args: &BenchArgs, max_k: usize) -> Result<Vec<
     let truth_k = nbrs_shape[1];
     if truth_k < max_k {
         bail!(
-            "--ks asks for top-{} but '{}' only has {} neighbors per query",
+            "--ks asks for top-{} but 'neighbors' only has {} per query",
             max_k,
-            args.gt_neighbors,
             truth_k
         );
     }
@@ -371,11 +366,11 @@ fn load_gt_from_hdf5(path: &Path, args: &BenchArgs, max_k: usize) -> Result<Vec<
 
     let test_vectors: Array2<f32> = test_ds
         .read_slice_2d(s![..n_queries, ..])
-        .with_context(|| format!("reading dataset '{}'", args.gt_test))?;
-    let neighbors: Array2<i64> = read_int_matrix(&nbrs_ds, n_queries, max_k)
-        .with_context(|| format!("reading dataset '{}'", args.gt_neighbors))?;
+        .context("reading dataset 'test'")?;
+    let neighbors: Array2<i64> =
+        read_int_matrix(&nbrs_ds, n_queries, max_k).context("reading dataset 'neighbors'")?;
 
-    let distances: Option<Array2<f32>> = match file.dataset(&args.gt_distances) {
+    let distances: Option<Array2<f32>> = match file.dataset("distances") {
         Ok(ds) => {
             let shape = ds.shape();
             if shape.len() != 2 || shape[0] != test_shape[0] || shape[1] != truth_k {
@@ -386,10 +381,7 @@ fn load_gt_from_hdf5(path: &Path, args: &BenchArgs, max_k: usize) -> Result<Vec<
             }
         }
         Err(_) => {
-            println!(
-                "  distances: dataset '{}' not present; sim-loss will be empty",
-                args.gt_distances
-            );
+            println!("  distances: dataset not present; sim-loss will be empty");
             None
         }
     };

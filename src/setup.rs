@@ -68,6 +68,16 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: SetupArgs) -> Result
         args.input = Some(ensure_dataset(name)?);
     }
 
+    if args.only_vector {
+        let dim = match args.input.as_deref() {
+            Some(path) => read_dim_from_hdf5(path)?,
+            None => args.dim,
+        };
+        create_vector_index(client, db, coll, &args, dim, metric, idx_name)?;
+        print_index_stats(client, db, coll)?;
+        return Ok(());
+    }
+
     print_banner(&args, db, coll, metric, idx_name);
 
     // Validate the HDF5 input before any destructive op on the database.
@@ -98,7 +108,7 @@ fn dataset_cache_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join("dataset-embeddings"))
 }
 
-fn ensure_dataset(name: &str) -> Result<PathBuf> {
+pub fn ensure_dataset(name: &str) -> Result<PathBuf> {
     if !KNOWN_DATASETS.contains(&name) {
         bail!(
             "Unknown ann-benchmarks dataset '{}'. Known datasets:\n  {}",
@@ -247,6 +257,17 @@ fn insert_random(client: &Client, db: &str, coll: &str, args: &SetupArgs) -> Res
         dim: args.dim,
         ndocs,
     })
+}
+
+fn read_dim_from_hdf5(path: &Path) -> Result<usize> {
+    let file =
+        hdf5::File::open(path).with_context(|| format!("opening HDF5 file {}", path.display()))?;
+    let ds = file.dataset("train").context("opening dataset 'train'")?;
+    let shape = ds.shape();
+    if shape.len() != 2 {
+        bail!("dataset 'train' is {}D, expected 2D", shape.len());
+    }
+    Ok(shape[1])
 }
 
 fn validate_hdf5(path: &Path, dataset_name: &str) -> Result<()> {

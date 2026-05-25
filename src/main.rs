@@ -70,6 +70,11 @@ pub struct SetupArgs {
     #[arg(long)]
     pub ann_dataset: Option<String>,
 
+    /// Skip data ingestion and only (re)create the vector index on existing data.
+    /// Dimension is inferred from --ann-dataset or taken from --dim.
+    #[arg(long)]
+    pub only_vector: bool,
+
     /// Vector dimension (random mode only; ignored with --input).
     #[arg(long, default_value_t = 768)]
     pub dim: usize,
@@ -107,27 +112,14 @@ pub struct SetupArgs {
 
 #[derive(Args)]
 pub struct BenchArgs {
-    /// HDF5 file with pre-computed ground truth (e.g. an ann-benchmarks file
-    /// with `test`, `neighbors`, and optional `distances` arrays). When set,
-    /// queries and truth are read from this file instead of being sampled
-    /// from the collection and brute-forced via COSINE_SIMILARITY.
-    #[arg(long)]
+    // Resolved HDF5 path; populated at runtime from --ann-dataset, never set by the user.
+    #[arg(skip)]
     pub gt_file: Option<PathBuf>,
 
-    /// Dataset name within --gt-file holding query vectors. Shape (Q, dim).
-    #[arg(long, default_value = "test")]
-    pub gt_test: String,
-
-    /// Dataset name within --gt-file holding ground-truth neighbor IDs.
-    /// Shape (Q, K_truth), integer row indices into the train set.
-    #[arg(long, default_value = "neighbors")]
-    pub gt_neighbors: String,
-
-    /// Optional dataset name within --gt-file holding ground-truth distances.
-    /// Shape (Q, K_truth). For ann-benchmarks "angular" files, distances are
-    /// 1 - cos_sim. Used to populate the similarity-loss table.
-    #[arg(long, default_value = "distances")]
-    pub gt_distances: String,
+    /// Named ann-benchmarks dataset to use for ground-truth queries (e.g. glove-100-angular).
+    /// The file is cached in ~/dataset-embeddings/ and reused on subsequent runs.
+    #[arg(long)]
+    pub ann_dataset: Option<String>,
 
     /// Number of query vectors to use. In collection mode: sampled from the
     /// collection. In --gt-file mode: truncates the test set.
