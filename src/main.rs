@@ -93,9 +93,10 @@ pub struct SetupArgs {
     #[arg(long, default_value_t = 3)]
     pub shards: u64,
 
-    /// Base RNG seed (random mode only).
-    #[arg(long, default_value_t = 0xc057_1u64)]
-    pub seed: u64,
+    /// Base RNG seed (random mode only). If omitted, a fresh random seed is
+    /// generated and printed.
+    #[arg(long)]
+    pub seed: Option<u64>,
 
     /// Documents per insert batch.
     #[arg(long, default_value_t = 5_000)]

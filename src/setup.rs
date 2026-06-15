@@ -68,6 +68,13 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: SetupArgs) -> Result
         args.input = Some(ensure_dataset(name)?);
     }
 
+    // Random mode: resolve the RNG seed, generating a fresh one when omitted.
+    if args.input.is_none() {
+        let seed = args.seed.unwrap_or_else(rand::random);
+        args.seed = Some(seed);
+        println!("RNG seed: {}", seed);
+    }
+
     if args.only_vector {
         let dim = match args.input.as_deref() {
             Some(path) => read_dim_from_hdf5(path)?,
@@ -183,7 +190,8 @@ fn print_banner(args: &SetupArgs, db: &str, coll: &str, metric: &str, idx_name: 
         Some(p) => format!("HDF5 file {}", p.display()),
         None => format!(
             "random uniform[-1, 1] (seed={}, dim={})",
-            args.seed, args.dim
+            args.seed.expect("seed resolved in run() for random mode"),
+            args.dim
         ),
     };
     let count_str = match (&args.input, args.ndocs) {
@@ -236,7 +244,8 @@ fn insert_random(client: &Client, db: &str, coll: &str, args: &SetupArgs) -> Res
 
     let result: Result<()> = pool.install(|| {
         batches.into_par_iter().try_for_each(|(s, e)| {
-            let docs = make_random_batch(s, e, args.dim, args.seed);
+            let seed = args.seed.expect("seed resolved in run() for random mode");
+            let docs = make_random_batch(s, e, args.dim, seed);
             client.insert_docs(db, coll, &docs)?;
             let n = counter.fetch_add((e - s) as u64, Ordering::Relaxed) + (e - s) as u64;
             pb_ref.set_position(n);
