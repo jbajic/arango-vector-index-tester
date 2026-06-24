@@ -26,6 +26,10 @@ struct NProbeResult {
     avg_time_ms: f64,
 }
 
+/// Per-query measurement for one nProbe value: (recall@K for each K,
+/// similarity-loss@K for each K).
+type PerQueryStats = (Vec<f64>, Vec<Option<f64>>);
+
 pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result<()> {
     if let Some(ref name) = args.ann_dataset.clone() {
         args.gt_file = Some(ensure_dataset(name)?);
@@ -142,7 +146,7 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result
     for &nprobe in &nprobes {
         println!("\nMeasuring approx with nProbe={}...", nprobe);
         let t0 = Instant::now();
-        let per_query: Result<Vec<(Vec<f64>, Vec<Option<f64>>)>> = queries
+        let per_query: Result<Vec<PerQueryStats>> = queries
             .iter()
             .map(|q| {
                 let approx =
@@ -493,6 +497,7 @@ fn print_target_recall_report(
     println!();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_banner(
     args: &BenchArgs,
     db: &str,

@@ -309,16 +309,12 @@ fn insert_from_hdf5(
     args: &SetupArgs,
     path: &Path,
 ) -> Result<Inserted> {
-    println!(
-        "Reading HDF5 file {} (dataset '{}')...",
-        path.display(),
-        "train"
-    );
+    println!("Reading HDF5 file {} (dataset 'train')...", path.display());
     let t_read = Instant::now();
     let file =
         hdf5::File::open(path).with_context(|| format!("opening HDF5 file {}", path.display()))?;
     let ds = file
-        .dataset(&"train")
+        .dataset("train")
         .with_context(|| format!("opening dataset '{}'", "train"))?;
     let shape = ds.shape();
     if shape.len() != 2 {
