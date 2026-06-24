@@ -4,6 +4,15 @@ use reqwest::{Method, StatusCode};
 use serde_json::{json, Value};
 use std::time::Duration;
 
+/// Outcome of submitting a request via the async job API.
+pub enum AsyncSubmission {
+    /// The server queued the operation; poll this job id for the result.
+    Job(String),
+    /// The server ran the operation synchronously and returned the result
+    /// (i.e. the async header was not honored).
+    Done(Value),
+}
+
 #[derive(Clone)]
 pub struct Client {
     http: HttpClient,
@@ -134,19 +143,97 @@ impl Client {
         self.request(Method::GET, &path, None)
     }
 
-    /// Run autotune for an index, persisting a recall→nProbe operating-point
-    /// table for the given topK / minRecall. `index_id` is the full handle
-    /// ("collection/id").
-    pub fn run_autotune(
+    /// Submit an autotune run for an index, persisting a recall→nProbe
+    /// operating-point table for the given topK / targetRecall. Autotune can run
+    /// far longer than a normal request, so it is dispatched via ArangoDB's
+    /// async job API (`x-arango-async: store`): the server queues it and
+    /// returns a job id immediately instead of holding the connection open for
+    /// the whole run. `index_id` is the full handle ("collection/id").
+    pub fn submit_autotune(
         &self,
         db: &str,
         index_id: &str,
         top_k: usize,
-        min_recall: f64,
-    ) -> Result<Value> {
+        target_recall: f64,
+    ) -> Result<AsyncSubmission> {
         let path = format!("/_db/{}/_api/index/{}/autotune", db, index_id);
-        let body = json!({ "topK": top_k, "minRecall": min_recall });
-        self.request(Method::POST, &path, Some(&body))
+        let body = json!({ "topK": top_k, "targetRecall": target_recall });
+        self.submit_async(Method::POST, &path, Some(&body))
+    }
+
+    /// Send a request with `x-arango-async: store`. The server queues the
+    /// operation and responds immediately with a job id (the normal case), or,
+    /// if it ran the request synchronously, the result itself.
+    fn submit_async(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<AsyncSubmission> {
+        let url = self.url(path);
+        let mut req = self
+            .http
+            .request(method.clone(), &url)
+            .basic_auth(&self.user, Some(&self.password))
+            .header("x-arango-async", "store");
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        let resp = req.send().with_context(|| format!("{} {}", method, url))?;
+        let status = resp.status();
+        let job_id = resp
+            .headers()
+            .get("x-arango-async-id")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let text = resp
+            .text()
+            .with_context(|| format!("reading body from {} {}", method, url))?;
+        if !status.is_success() {
+            bail!("{} {} -> {}: {}", method, url, status, text);
+        }
+        if let Some(id) = job_id {
+            return Ok(AsyncSubmission::Job(id));
+        }
+        // The async header was not honored; the server ran it synchronously and
+        // returned the result inline.
+        let value: Value = if text.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(&text)
+                .with_context(|| format!("decoding JSON from {} {}: {}", method, url, text))?
+        };
+        Ok(AsyncSubmission::Done(value))
+    }
+
+    /// Poll an async job by id. Returns `Some(result)` once the job has
+    /// finished (the result carries the original operation's status and body),
+    /// or `None` while it is still running.
+    pub fn poll_job(&self, db: &str, job_id: &str) -> Result<Option<Value>> {
+        let url = self.url(&format!("/_db/{}/_api/job/{}", db, job_id));
+        let resp = self
+            .http
+            .put(&url)
+            .basic_auth(&self.user, Some(&self.password))
+            .send()
+            .with_context(|| format!("PUT {}", url))?;
+        let status = resp.status();
+        if status == StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+        let text = resp
+            .text()
+            .with_context(|| format!("reading job result from {}", url))?;
+        let value: Value = if text.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(&text)
+                .with_context(|| format!("decoding job result from {}: {}", url, text))?
+        };
+        if !status.is_success() {
+            bail!("async job {} failed: {} {}", job_id, status, value);
+        }
+        Ok(Some(value))
     }
 
     pub fn list_indexes(&self, db: &str, coll: &str, with_hidden: bool) -> Result<Value> {

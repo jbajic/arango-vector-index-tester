@@ -57,6 +57,12 @@ struct Inserted {
 }
 
 pub fn run(client: &Client, db: &str, coll: &str, mut args: SetupArgs) -> Result<()> {
+    // The server requires nLists to equal the nlist implied by the factory
+    // string, so fail fast rather than letting index creation error out later.
+    if args.factory.is_some() && args.nlists.is_none() {
+        bail!("--factory requires --nlists set to the factory string's nlist");
+    }
+
     let metric = args
         .ann_dataset
         .as_deref()
@@ -429,8 +435,16 @@ fn create_vector_index(
         .map(|n| n.to_string())
         .unwrap_or_else(|| "auto".to_string());
     println!(
-        "Creating vector index '{}' (metric={}, dim={}, nLists={}, trainingIterations={})...",
-        idx_name, metric, dim, nlists_label, 25
+        "Creating vector index '{}' (metric={}, dim={}, nLists={}, trainingIterations={}{})...",
+        idx_name,
+        metric,
+        dim,
+        nlists_label,
+        25,
+        args.factory
+            .as_deref()
+            .map(|f| format!(", factory={}", f))
+            .unwrap_or_default()
     );
     let start = Instant::now();
     let mut params = json!({
@@ -440,6 +454,9 @@ fn create_vector_index(
     });
     if let Some(n) = args.nlists {
         params["nLists"] = json!(n);
+    }
+    if let Some(ref f) = args.factory {
+        params["factory"] = json!(f);
     }
     let def = json!({
         "name": idx_name,

@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::client::Client;
+use crate::client::{AsyncSubmission, Client};
 use crate::setup::ensure_dataset;
 use crate::BenchArgs;
 
@@ -216,7 +216,8 @@ fn run_target_recall(
 
     // The targetRecall query option resolves the probe count from the index's
     // persisted autotune table, so the table must already cover (max_k, target)
-    // before we query. Reuse it when present; otherwise run autotune.
+    // before we query. Reuse it when present (unless --retune); otherwise run
+    // autotune.
     ensure_autotuned(
         client,
         db,
@@ -224,6 +225,7 @@ fn run_target_recall(
         max_k,
         target,
         args.autotune_timeout_sec,
+        args.retune,
     )?;
 
     let queries: Vec<Query> = if let Some(path) = args.gt_file.as_deref() {
@@ -270,11 +272,12 @@ fn run_target_recall(
 }
 
 /// Ensure the index has a persisted autotune operating-point table that
-/// reaches `target` recall at `top_k`. Checks the GET endpoint first and only
-/// runs autotune (POST) when no existing table covers the request. Autotune
-/// can run for a while (it samples the index and sweeps FAISS params), so after
-/// kicking it off we poll the GET endpoint until the table appears or
+/// reaches `target` recall at `top_k`. Unless `force` is set, checks the GET
+/// endpoint first and only runs autotune when no existing table covers the
+/// request. Autotune can run far longer than a single HTTP request, so it is
+/// submitted via the async job API and the job is polled until it finishes or
 /// `timeout_sec` elapses.
+#[allow(clippy::too_many_arguments)]
 fn ensure_autotuned(
     client: &Client,
     db: &str,
@@ -282,75 +285,74 @@ fn ensure_autotuned(
     top_k: usize,
     target: f64,
     timeout_sec: u64,
+    force: bool,
 ) -> Result<()> {
-    println!(
-        "\nChecking autotune operating points (topK={}, target recall={:.3})...",
-        top_k, target
-    );
-    let existing = client.get_autotune(db, index_id);
-    if let Ok(v) = &existing {
-        if autotune_table_covers(v, top_k, target) {
-            println!("  Persisted table already covers this target; skipping autotune.");
-            print_operating_points(v, top_k);
-            return Ok(());
+    if force {
+        println!(
+            "\nForcing autotune re-run (topK={}, target recall={:.3})...",
+            top_k, target
+        );
+    } else {
+        println!(
+            "\nChecking autotune operating points (topK={}, target recall={:.3})...",
+            top_k, target
+        );
+        match client.get_autotune(db, index_id) {
+            Ok(v) if autotune_table_covers(&v, top_k, target) => {
+                println!("  Persisted table already covers this target; skipping autotune.");
+                println!("  (pass --retune to force a fresh autotune run.)");
+                print_operating_points(&v, top_k);
+                return Ok(());
+            }
+            Ok(_) => println!("  No covering table; running autotune."),
+            Err(e) => println!("  No persisted operating points available yet ({e})."),
         }
-    } else if let Err(e) = &existing {
-        println!("  No persisted operating points available yet ({e}).");
     }
 
-    println!("  Not covered; running autotune (samples the index and sweeps FAISS params)...");
+    println!("  Running autotune (async; samples the index and sweeps FAISS params)...");
     let t0 = Instant::now();
-    let result = client.run_autotune(db, index_id, top_k, target)?;
-
-    // A populated table means autotune has finished; if it still doesn't reach
-    // the target the index simply can't achieve it (queries fall back to the
-    // best point). An absent/empty table means the POST kicked off async work,
-    // so wait for it to materialize via the GET endpoint.
-    let table = if autotune_table_has_points(&result, top_k) {
-        result
-    } else {
-        wait_for_autotune(client, db, index_id, top_k, timeout_sec, t0)?
+    let result = match client.submit_autotune(db, index_id, top_k, target)? {
+        AsyncSubmission::Done(v) => v,
+        AsyncSubmission::Job(job_id) => {
+            wait_for_autotune_job(client, db, &job_id, timeout_sec, t0)?
+        }
     };
     println!("  Autotune done in {:.1}s.", t0.elapsed().as_secs_f64());
 
-    if !autotune_table_covers(&table, top_k, target) {
+    if !autotune_table_covers(&result, top_k, target) {
         println!(
             "  WARNING: autotune could not reach recall {:.3} at topK={}; the index may not be",
             target, top_k
         );
         println!("  able to achieve it. Queries will fall back to the best available point.");
     }
-    print_operating_points(&table, top_k);
+    print_operating_points(&result, top_k);
     Ok(())
 }
 
-/// Poll the GET autotune endpoint until a populated table for `top_k` appears
-/// or `timeout_sec` elapses.
-fn wait_for_autotune(
+/// Poll the async autotune job until it finishes or `timeout_sec` elapses.
+fn wait_for_autotune_job(
     client: &Client,
     db: &str,
-    index_id: &str,
-    top_k: usize,
+    job_id: &str,
     timeout_sec: u64,
     started: Instant,
 ) -> Result<Value> {
     const POLL_INTERVAL: Duration = Duration::from_secs(3);
     println!(
-        "  Waiting for autotune to complete (timeout {}s)...",
-        timeout_sec
+        "  Submitted autotune job {} (timeout {}s); polling...",
+        job_id, timeout_sec
     );
     loop {
         std::thread::sleep(POLL_INTERVAL);
-        let elapsed = started.elapsed();
-        match client.get_autotune(db, index_id) {
-            Ok(v) if autotune_table_has_points(&v, top_k) => return Ok(v),
-            Ok(_) => {}
-            Err(e) => println!("  (polling autotune table: {e})"),
+        if let Some(v) = client.poll_job(db, job_id)? {
+            return Ok(v);
         }
+        let elapsed = started.elapsed();
         if elapsed.as_secs() >= timeout_sec {
             bail!(
-                "autotune did not produce an operating-point table for topK={} within {}s",
-                top_k,
+                "autotune job {} did not finish within {}s",
+                job_id,
                 timeout_sec
             );
         }
@@ -364,13 +366,6 @@ fn autotune_table_for(v: &Value, top_k: usize) -> Option<&Value> {
         .as_array()?
         .iter()
         .find(|t| t["topK"].as_u64() == Some(top_k as u64))
-}
-
-/// True if a (finished) operating-point table exists for `top_k`.
-fn autotune_table_has_points(v: &Value, top_k: usize) -> bool {
-    autotune_table_for(v, top_k)
-        .and_then(|t| t["points"].as_array())
-        .is_some_and(|ps| !ps.is_empty())
 }
 
 /// True if the table for `top_k` has at least one point reaching `target` recall.

@@ -89,9 +89,18 @@ pub struct SetupArgs {
     pub ndocs: Option<usize>,
 
     /// IVF nLists. If omitted, ArangoDB picks one automatically (auto-sqrt
-    /// based on document count).
+    /// based on document count). Required when --factory is set, and must equal
+    /// the nlist implied by the factory string.
     #[arg(long)]
     pub nlists: Option<u64>,
+
+    /// FAISS index_factory string passed verbatim to the server (e.g.
+    /// "IVF4096_HNSW32,PQ32x8"). Must resolve to an IVF index. The string is
+    /// NOT templated: write a concrete nlist, omit the dimension prefix, and
+    /// leave the metric out (metric/dimension come from the index params).
+    /// Requires --nlists to match the factory's nlist.
+    #[arg(long)]
+    pub factory: Option<String>,
 
     /// Number of shards on the dataset collection.
     #[arg(long, default_value_t = 3)]
@@ -159,6 +168,12 @@ pub struct BenchArgs {
     /// seconds (targetRecall mode only).
     #[arg(long, default_value_t = 1800)]
     pub autotune_timeout_sec: u64,
+
+    /// Force a fresh autotune run even when a persisted operating-point table
+    /// already covers the target recall (targetRecall mode only). Use this to
+    /// re-tune after the data changed or to refresh stale operating points.
+    #[arg(long)]
+    pub retune: bool,
 
     /// Parallel workers for the ground-truth pass (collection mode only).
     /// The approx sweep stays serial so per-query timings are meaningful.
