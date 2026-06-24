@@ -141,8 +141,24 @@ pub struct BenchArgs {
 
     /// nProbe values to sweep (clamped to nLists). Default is a log-spaced
     /// sweep covering five coverage tiers; pass a denser set when zooming in.
+    /// Ignored when --target-recall is set.
     #[arg(long, default_value = "1,8,32,128,512", value_delimiter = ',')]
     pub nprobes: Vec<u64>,
+
+    /// Target recall to request via the index autotune feature, in (0, 1].
+    /// When set, bench switches from the nProbe sweep to targetRecall mode: it
+    /// ensures the index is autotuned for this recall (reusing persisted
+    /// operating points when the GET autotune table already covers it,
+    /// otherwise running autotune), issues queries with {targetRecall: <value>}
+    /// instead of {nProbe: ...}, and reports on how many query points the
+    /// achieved recall falls below the target.
+    #[arg(long)]
+    pub target_recall: Option<f64>,
+
+    /// How long to wait for autotune to populate the operating-point table, in
+    /// seconds (targetRecall mode only).
+    #[arg(long, default_value_t = 1800)]
+    pub autotune_timeout_sec: u64,
 
     /// Parallel workers for the ground-truth pass (collection mode only).
     /// The approx sweep stays serial so per-query timings are meaningful.

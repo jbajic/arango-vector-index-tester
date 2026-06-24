@@ -5,7 +5,7 @@ use rayon::prelude::*;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::client::Client;
 use crate::setup::ensure_dataset;
@@ -49,6 +49,10 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result
         .as_str()
         .context("index has no name field")?
         .to_string();
+    let index_id = vec_idx["id"]
+        .as_str()
+        .context("index has no id field")?
+        .to_string();
     let nlists = vec_idx["params"]["nLists"]
         .as_u64()
         .or_else(|| vec_idx["resolvedNLists"].as_u64())
@@ -66,6 +70,31 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result
         .context("could not determine dimension from index definition")?;
     let count = client.collection_count(db, coll)?;
 
+    let mut ks: Vec<usize> = args.topk.clone();
+    ks.sort_unstable();
+    ks.dedup();
+    let max_k = *ks.last().context("--topk is empty")?;
+
+    if let Some(target) = args.target_recall {
+        if target <= 0.0 || target > 1.0 {
+            bail!("--target-recall must be a number in (0, 1], got {}", target);
+        }
+        return run_target_recall(
+            client,
+            db,
+            coll,
+            &args,
+            &index_name,
+            &index_id,
+            count,
+            dimension,
+            nlists,
+            &ks,
+            max_k,
+            target,
+        );
+    }
+
     let mut nprobes: Vec<u64> = args
         .nprobes
         .iter()
@@ -80,11 +109,6 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result
             nlists
         );
     }
-
-    let mut ks: Vec<usize> = args.topk.clone();
-    ks.sort_unstable();
-    ks.dedup();
-    let max_k = *ks.last().context("--topk is empty")?;
 
     print_banner(
         &args,
@@ -104,7 +128,7 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result
         coll,
         dimension as usize,
         max_k,
-        sample_nprobe,
+        &format!("nProbe: {}", sample_nprobe),
         &index_name,
     )?;
 
@@ -162,6 +186,318 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_target_recall(
+    client: &Client,
+    db: &str,
+    coll: &str,
+    args: &BenchArgs,
+    index_name: &str,
+    index_id: &str,
+    count: u64,
+    dimension: u64,
+    nlists: u64,
+    ks: &[usize],
+    max_k: usize,
+    target: f64,
+) -> Result<()> {
+    print_banner_target_recall(
+        args, db, coll, count, dimension, nlists, index_name, ks, target,
+    );
+    print_sample_query_and_plan(
+        client,
+        db,
+        coll,
+        dimension as usize,
+        max_k,
+        &format!("targetRecall: {}", target),
+        index_name,
+    )?;
+
+    // The targetRecall query option resolves the probe count from the index's
+    // persisted autotune table, so the table must already cover (max_k, target)
+    // before we query. Reuse it when present; otherwise run autotune.
+    ensure_autotuned(
+        client,
+        db,
+        index_id,
+        max_k,
+        target,
+        args.autotune_timeout_sec,
+    )?;
+
+    let queries: Vec<Query> = if let Some(path) = args.gt_file.as_deref() {
+        load_gt_from_hdf5(path, args, max_k)?
+    } else {
+        compute_gt_from_collection(client, db, coll, args, max_k)?
+    };
+
+    println!(
+        "\nRunning {} queries with targetRecall={:.3} (serial, for clean timings)...",
+        queries.len(),
+        target
+    );
+    let t0 = Instant::now();
+    let per_query: Result<Vec<Vec<f64>>> = queries
+        .iter()
+        .map(|q| {
+            let approx =
+                run_approx_target_recall(client, db, coll, &q.vector, max_k, target, index_name)?;
+            Ok(ks
+                .iter()
+                .map(|&k| recall_at_k(&q.truth, &approx, k))
+                .collect())
+        })
+        .collect();
+    let per_query = per_query?;
+    let n = per_query.len();
+    if n == 0 {
+        bail!("no query vectors available");
+    }
+    let avg_time_ms = t0.elapsed().as_millis() as f64 / n as f64;
+
+    print_target_recall_report(
+        count,
+        dimension,
+        nlists,
+        index_name,
+        ks,
+        target,
+        &per_query,
+        avg_time_ms,
+    );
+    Ok(())
+}
+
+/// Ensure the index has a persisted autotune operating-point table that
+/// reaches `target` recall at `top_k`. Checks the GET endpoint first and only
+/// runs autotune (POST) when no existing table covers the request. Autotune
+/// can run for a while (it samples the index and sweeps FAISS params), so after
+/// kicking it off we poll the GET endpoint until the table appears or
+/// `timeout_sec` elapses.
+fn ensure_autotuned(
+    client: &Client,
+    db: &str,
+    index_id: &str,
+    top_k: usize,
+    target: f64,
+    timeout_sec: u64,
+) -> Result<()> {
+    println!(
+        "\nChecking autotune operating points (topK={}, target recall={:.3})...",
+        top_k, target
+    );
+    let existing = client.get_autotune(db, index_id);
+    if let Ok(v) = &existing {
+        if autotune_table_covers(v, top_k, target) {
+            println!("  Persisted table already covers this target; skipping autotune.");
+            print_operating_points(v, top_k);
+            return Ok(());
+        }
+    } else if let Err(e) = &existing {
+        println!("  No persisted operating points available yet ({e}).");
+    }
+
+    println!("  Not covered; running autotune (samples the index and sweeps FAISS params)...");
+    let t0 = Instant::now();
+    let result = client.run_autotune(db, index_id, top_k, target)?;
+
+    // A populated table means autotune has finished; if it still doesn't reach
+    // the target the index simply can't achieve it (queries fall back to the
+    // best point). An absent/empty table means the POST kicked off async work,
+    // so wait for it to materialize via the GET endpoint.
+    let table = if autotune_table_has_points(&result, top_k) {
+        result
+    } else {
+        wait_for_autotune(client, db, index_id, top_k, timeout_sec, t0)?
+    };
+    println!("  Autotune done in {:.1}s.", t0.elapsed().as_secs_f64());
+
+    if !autotune_table_covers(&table, top_k, target) {
+        println!(
+            "  WARNING: autotune could not reach recall {:.3} at topK={}; the index may not be",
+            target, top_k
+        );
+        println!("  able to achieve it. Queries will fall back to the best available point.");
+    }
+    print_operating_points(&table, top_k);
+    Ok(())
+}
+
+/// Poll the GET autotune endpoint until a populated table for `top_k` appears
+/// or `timeout_sec` elapses.
+fn wait_for_autotune(
+    client: &Client,
+    db: &str,
+    index_id: &str,
+    top_k: usize,
+    timeout_sec: u64,
+    started: Instant,
+) -> Result<Value> {
+    const POLL_INTERVAL: Duration = Duration::from_secs(3);
+    println!(
+        "  Waiting for autotune to complete (timeout {}s)...",
+        timeout_sec
+    );
+    loop {
+        std::thread::sleep(POLL_INTERVAL);
+        let elapsed = started.elapsed();
+        match client.get_autotune(db, index_id) {
+            Ok(v) if autotune_table_has_points(&v, top_k) => return Ok(v),
+            Ok(_) => {}
+            Err(e) => println!("  (polling autotune table: {e})"),
+        }
+        if elapsed.as_secs() >= timeout_sec {
+            bail!(
+                "autotune did not produce an operating-point table for topK={} within {}s",
+                top_k,
+                timeout_sec
+            );
+        }
+        println!("  ... still tuning ({:.0}s elapsed)", elapsed.as_secs_f64());
+    }
+}
+
+/// The autotune operating-point table for `top_k`, if present in the response.
+fn autotune_table_for(v: &Value, top_k: usize) -> Option<&Value> {
+    v["tunedTables"]
+        .as_array()?
+        .iter()
+        .find(|t| t["topK"].as_u64() == Some(top_k as u64))
+}
+
+/// True if a (finished) operating-point table exists for `top_k`.
+fn autotune_table_has_points(v: &Value, top_k: usize) -> bool {
+    autotune_table_for(v, top_k)
+        .and_then(|t| t["points"].as_array())
+        .is_some_and(|ps| !ps.is_empty())
+}
+
+/// True if the table for `top_k` has at least one point reaching `target` recall.
+fn autotune_table_covers(v: &Value, top_k: usize, target: f64) -> bool {
+    autotune_table_for(v, top_k)
+        .and_then(|t| t["points"].as_array())
+        .is_some_and(|ps| {
+            ps.iter()
+                .any(|p| p["recall"].as_f64().is_some_and(|r| r >= target - 1e-9))
+        })
+}
+
+fn print_operating_points(v: &Value, top_k: usize) {
+    let table = autotune_table_for(v, top_k);
+
+    // Echo back every scalar param the server reports on the table (topK,
+    // minRecall, defaultNprobe, ...) so the autotune config is visible.
+    if let Some(obj) = table.and_then(|t| t.as_object()) {
+        let params: Vec<String> = obj
+            .iter()
+            .filter(|(_, val)| !val.is_array() && !val.is_object())
+            .map(|(k, val)| format!("{}={}", k, val))
+            .collect();
+        if !params.is_empty() {
+            println!("  Autotune params: {}", params.join(", "));
+        }
+    }
+
+    let points = match table.and_then(|t| t["points"].as_array()) {
+        Some(p) if !p.is_empty() => p,
+        _ => return,
+    };
+    println!("  Operating points (topK={}):", top_k);
+    println!("    recall  | param            | time(ms)");
+    println!("    --------|------------------|---------");
+    for p in points {
+        let recall = p["recall"].as_f64().unwrap_or(f64::NAN);
+        let key = p["faissKey"].as_str().unwrap_or("?");
+        let time_ms = p["timeSeconds"]
+            .as_f64()
+            .map(|s| s * 1000.0)
+            .unwrap_or(f64::NAN);
+        println!("    {:>6.3}  | {:<16} | {:>7.3}", recall, key, time_ms);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_banner_target_recall(
+    args: &BenchArgs,
+    db: &str,
+    coll: &str,
+    count: u64,
+    dim: u64,
+    nlists: u64,
+    index_name: &str,
+    ks: &[usize],
+    target: f64,
+) {
+    let truth_source = match &args.gt_file {
+        Some(p) => format!("HDF5 file {}", p.display()),
+        None => format!(
+            "first {} docs of '{}' (brute-force COSINE_SIMILARITY, {} workers)",
+            args.queries, coll, args.gt_workers
+        ),
+    };
+    println!("================================================================");
+    println!("vrecall bench (targetRecall mode)");
+    println!("================================================================");
+    println!("What we're going to do:");
+    println!("  - Use existing collection '{}.{}'", db, coll);
+    println!("    - {} vectors, dim={}", count, dim);
+    println!("    - vector index: '{}' (nLists={})", index_name, nlists);
+    println!("  - Ground truth: {}", truth_source);
+    println!("  - Query vectors: {}", args.queries);
+    println!("  - Recall cutoffs K: {:?}", ks);
+    println!("  - Target recall: {:.3}", target);
+    println!("  - Ensure the index is autotuned for this recall, then query with");
+    println!(
+        "    {{targetRecall: {}}} and count query points below the target.",
+        target
+    );
+    println!();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_target_recall_report(
+    count: u64,
+    dim: u64,
+    nlists: u64,
+    index_name: &str,
+    ks: &[usize],
+    target: f64,
+    per_query: &[Vec<f64>],
+    avg_time_ms: f64,
+) {
+    let n = per_query.len();
+    println!();
+    println!("================================================================");
+    println!("Target-recall report");
+    println!("  dataset:      {} vectors, dim={}", count, dim);
+    println!("  index:        '{}' (nLists={})", index_name, nlists);
+    println!("  targetRecall: {:.3}", target);
+    println!("  queries:      {}", n);
+    println!("================================================================");
+    println!("   K   | mean recall | min recall | below target | fail %");
+    println!("-------|-------------|------------|--------------|--------");
+    for (i, &k) in ks.iter().enumerate() {
+        let recalls: Vec<f64> = per_query.iter().map(|r| r[i]).collect();
+        let mean = recalls.iter().sum::<f64>() / n as f64;
+        let min = recalls.iter().copied().fold(f64::INFINITY, f64::min);
+        let fails = recalls.iter().filter(|&&r| r < target - 1e-9).count();
+        let fail_pct = 100.0 * fails as f64 / n as f64;
+        println!(
+            " {:>5} |    {:>6.3}   |   {:>6.3}   |   {:>4}/{:<4}  | {:>5.1}%",
+            k, mean, min, fails, n, fail_pct
+        );
+    }
+    let qps = 1000.0 / avg_time_ms;
+    println!();
+    println!(
+        "Per-query latency: {:.1} ms ({:.1} QPS). \"below target\" counts queries whose",
+        avg_time_ms, qps
+    );
+    println!("achieved recall@K fell under the requested targetRecall.");
+    println!();
+}
+
 fn print_banner(
     args: &BenchArgs,
     db: &str,
@@ -198,20 +534,17 @@ fn print_banner(
 fn print_sample_query_and_plan(
     client: &Client,
     db: &str,
-    _coll: &str,
+    coll: &str,
     dim: usize,
     max_k: usize,
-    sample_nprobe: u64,
+    opts: &str,
     index_name: &str,
 ) -> Result<()> {
     let q = format!(
-        "FOR d IN {} OPTIONS {{indexHint: \"{}\", forceIndexHint: true}} LET sim = APPROX_NEAR_COSINE(d.vector, @qp, {{nProbe: {}}}) SORT sim DESC LIMIT {} RETURN {{k: d.idx, s: sim}}",
-        _coll, index_name, sample_nprobe, max_k
+        "FOR d IN {} OPTIONS {{indexHint: \"{}\", forceIndexHint: true}} LET sim = APPROX_NEAR_COSINE(d.vector, @qp, {{{}}}) SORT sim DESC LIMIT {} RETURN {{k: d.idx, s: sim}}",
+        coll, index_name, opts, max_k
     );
-    println!(
-        "Sample approx query (nProbe={}, LIMIT={}):",
-        sample_nprobe, max_k
-    );
+    println!("Sample approx query ({{{}}}, LIMIT={}):", opts, max_k);
     println!("  {}", q);
     println!();
 
@@ -463,6 +796,24 @@ fn run_approx_topk(
     // APPROX_NEAR_COSINE + SORT + LIMIT pattern reliably.
     let q = format!(
         "FOR d IN {coll} OPTIONS {{indexHint: \"{index_name}\", forceIndexHint: true}} LET sim = APPROX_NEAR_COSINE(d.vector, @qp, {{nProbe: {nprobe}}}) SORT sim DESC LIMIT {k} RETURN {{k: d.idx, s: sim}}"
+    );
+    let rows = client.aql(db, &q, json!({ "qp": qp }))?;
+    extract_id_sims(rows)
+}
+
+fn run_approx_target_recall(
+    client: &Client,
+    db: &str,
+    coll: &str,
+    qp: &[f32],
+    k: usize,
+    target_recall: f64,
+    index_name: &str,
+) -> Result<Vec<(i64, f64)>> {
+    // targetRecall is mutually exclusive with nProbe: the server picks the
+    // probe count from the persisted autotune table that meets this recall.
+    let q = format!(
+        "FOR d IN {coll} OPTIONS {{indexHint: \"{index_name}\", forceIndexHint: true}} LET sim = APPROX_NEAR_COSINE(d.vector, @qp, {{targetRecall: {target_recall}}}) SORT sim DESC LIMIT {k} RETURN {{k: d.idx, s: sim}}"
     );
     let rows = client.aql(db, &q, json!({ "qp": qp }))?;
     extract_id_sims(rows)

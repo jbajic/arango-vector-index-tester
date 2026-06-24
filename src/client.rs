@@ -127,6 +127,28 @@ impl Client {
         self.request(Method::POST, &path, Some(def))
     }
 
+    /// Fetch the persisted autotune operating-point tables for an index.
+    /// `index_id` is the full handle ("collection/id").
+    pub fn get_autotune(&self, db: &str, index_id: &str) -> Result<Value> {
+        let path = format!("/_db/{}/_api/index/{}/autotune", db, index_id);
+        self.request(Method::GET, &path, None)
+    }
+
+    /// Run autotune for an index, persisting a recall→nProbe operating-point
+    /// table for the given topK / minRecall. `index_id` is the full handle
+    /// ("collection/id").
+    pub fn run_autotune(
+        &self,
+        db: &str,
+        index_id: &str,
+        top_k: usize,
+        min_recall: f64,
+    ) -> Result<Value> {
+        let path = format!("/_db/{}/_api/index/{}/autotune", db, index_id);
+        let body = json!({ "topK": top_k, "minRecall": min_recall });
+        self.request(Method::POST, &path, Some(&body))
+    }
+
     pub fn list_indexes(&self, db: &str, coll: &str, with_hidden: bool) -> Result<Value> {
         let path = format!(
             "/_db/{}/_api/index?collection={}&withHidden={}",
