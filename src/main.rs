@@ -65,8 +65,12 @@ pub struct SetupArgs {
     #[arg(skip)]
     pub input: Option<PathBuf>,
 
-    /// Named ann-benchmarks dataset to download automatically (e.g. glove-100-angular).
-    /// The file is cached in ~/dataset-embeddings/ and reused on subsequent runs.
+    /// Named ann-benchmarks dataset to download automatically. The file is
+    /// cached in ~/dataset-embeddings/ and reused on subsequent runs. One of:
+    /// deep-image-96-angular, fashion-mnist-784-euclidean, gist-960-euclidean,
+    /// glove-25-angular, glove-50-angular, glove-100-angular, glove-200-angular,
+    /// lastfm-64-dot, mnist-784-euclidean, nytimes-16-angular,
+    /// nytimes-256-angular, sift-128-euclidean.
     #[arg(long)]
     pub ann_dataset: Option<String>,
 
@@ -117,8 +121,12 @@ pub struct BenchArgs {
     #[arg(skip)]
     pub gt_file: Option<PathBuf>,
 
-    /// Named ann-benchmarks dataset to use for ground-truth queries (e.g. glove-100-angular).
-    /// The file is cached in ~/dataset-embeddings/ and reused on subsequent runs.
+    /// Named ann-benchmarks dataset to use for ground-truth queries. The file
+    /// is cached in ~/dataset-embeddings/ and reused on subsequent runs. One of:
+    /// deep-image-96-angular, fashion-mnist-784-euclidean, gist-960-euclidean,
+    /// glove-25-angular, glove-50-angular, glove-100-angular, glove-200-angular,
+    /// lastfm-64-dot, mnist-784-euclidean, nytimes-16-angular,
+    /// nytimes-256-angular, sift-128-euclidean.
     #[arg(long)]
     pub ann_dataset: Option<String>,
 
