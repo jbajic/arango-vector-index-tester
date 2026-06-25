@@ -57,10 +57,18 @@ struct Inserted {
 }
 
 pub fn run(client: &Client, db: &str, coll: &str, mut args: SetupArgs) -> Result<()> {
-    // The server requires nLists to equal the nlist implied by the factory
-    // string, so fail fast rather than letting index creation error out later.
-    if args.factory.is_some() && args.nlists.is_none() {
-        bail!("--factory requires --nlists set to the factory string's nlist");
+    // A concrete factory string requires nLists to equal its nlist, so fail
+    // fast rather than letting index creation error out later. A templated
+    // factory (with a `{}` placeholder) lets the server fill in the resolved
+    // nLists, so nLists is optional there.
+    if let Some(ref factory) = args.factory {
+        if !factory.contains("{}") && args.nlists.is_none() {
+            bail!(
+                "a non-templated --factory requires --nlists set to the factory \
+                 string's nlist; use the `{{}}` placeholder (e.g. \
+                 \"IVF{{}}_HNSW32,PQ32x8\") to let the server auto-select nLists"
+            );
+        }
     }
 
     let metric = args
@@ -68,7 +76,10 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: SetupArgs) -> Result
         .as_deref()
         .map(infer_metric)
         .unwrap_or("cosine");
-    let idx_name = index_name(metric);
+    let idx_name = args
+        .index_name
+        .clone()
+        .unwrap_or_else(|| index_name(metric).to_string());
 
     if let Some(ref name) = args.ann_dataset.clone() {
         args.input = Some(ensure_dataset(name)?);
@@ -86,26 +97,33 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: SetupArgs) -> Result
             Some(path) => read_dim_from_hdf5(path)?,
             None => args.dim,
         };
-        create_vector_index(client, db, coll, &args, dim, metric, idx_name)?;
-        print_index_stats(client, db, coll)?;
+        create_vector_index(client, db, coll, &args, dim, metric, &idx_name)?;
+        print_index_stats(client, db, coll, &idx_name)?;
         return Ok(());
     }
 
-    print_banner(&args, db, coll, metric, idx_name);
+    print_banner(&args, db, coll, metric, &idx_name);
 
     // Validate the HDF5 input before any destructive op on the database.
     if let Some(path) = args.input.as_deref() {
         validate_hdf5(path, "train")?;
     }
 
-    println!("Dropping (if exists) and creating database '{}'...", db);
-    client.drop_database_if_exists(db)?;
-    client.create_database(db)?;
+    // Drop and recreate only the target collection, leaving any sibling
+    // collections (e.g. other datasets in the same database) untouched.
+    if client.database_exists(db)? {
+        println!("Using existing database '{}'.", db);
+    } else {
+        println!("Creating database '{}'...", db);
+        client.create_database(db)?;
+    }
+    println!("Dropping (if exists) and creating collection '{}'...", coll);
+    client.drop_collection_if_exists(db, coll)?;
     client.create_collection(db, coll, args.shards)?;
 
     let inserted = insert_dataset(client, db, coll, &args)?;
-    create_vector_index(client, db, coll, &args, inserted.dim, metric, idx_name)?;
-    print_index_stats(client, db, coll)?;
+    create_vector_index(client, db, coll, &args, inserted.dim, metric, &idx_name)?;
+    print_index_stats(client, db, coll, &idx_name)?;
 
     println!();
     println!(
@@ -210,8 +228,11 @@ fn print_banner(args: &SetupArgs, db: &str, coll: &str, metric: &str, idx_name: 
     println!("vrecall setup");
     println!("================================================================");
     println!("What we're going to do:");
-    println!("  1. Drop (if exists) and recreate database '{}'", db);
-    println!("  2. Create collection '{}' (shards={})", coll, args.shards);
+    println!("  1. Ensure database '{}' exists (created if missing)", db);
+    println!(
+        "  2. Drop (if exists) and recreate collection '{}' (shards={})",
+        coll, args.shards
+    );
     println!("  3. Insert {} from {}", count_str, source);
     println!(
         "     - {} parallel workers, batch={}",
@@ -469,13 +490,13 @@ fn create_vector_index(
     Ok(())
 }
 
-fn print_index_stats(client: &Client, db: &str, coll: &str) -> Result<()> {
+fn print_index_stats(client: &Client, db: &str, coll: &str, idx_name: &str) -> Result<()> {
     let v = client.list_indexes(db, coll, true)?;
     let arr = v["indexes"].as_array().context("indexes missing")?;
     let idx = arr
         .iter()
-        .find(|i| i["type"].as_str() == Some("vector"))
-        .context("vector index not found after creation")?;
+        .find(|i| i["name"].as_str() == Some(idx_name))
+        .with_context(|| format!("vector index '{}' not found after creation", idx_name))?;
     let params = &idx["params"];
     let user_nlists = params["nLists"].as_u64();
     let resolved = idx["resolvedNLists"]

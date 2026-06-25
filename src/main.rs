@@ -89,18 +89,28 @@ pub struct SetupArgs {
     pub ndocs: Option<usize>,
 
     /// IVF nLists. If omitted, ArangoDB picks one automatically (auto-sqrt
-    /// based on document count). Required when --factory is set, and must equal
-    /// the nlist implied by the factory string.
+    /// based on document count). Required with a non-templated --factory (must
+    /// equal the factory's nlist); optional with a templated factory, where the
+    /// server fills the `{}` placeholder with the resolved nLists.
     #[arg(long)]
     pub nlists: Option<u64>,
 
-    /// FAISS index_factory string passed verbatim to the server (e.g.
-    /// "IVF4096_HNSW32,PQ32x8"). Must resolve to an IVF index. The string is
-    /// NOT templated: write a concrete nlist, omit the dimension prefix, and
-    /// leave the metric out (metric/dimension come from the index params).
-    /// Requires --nlists to match the factory's nlist.
+    /// FAISS index_factory string passed to the server (e.g.
+    /// "IVF4096_HNSW32,PQ32x8"). Must resolve to an IVF index. Omit the
+    /// dimension prefix and the metric (both come from the index params). Use a
+    /// concrete nlist with a matching --nlists, or write a `{}` placeholder
+    /// (e.g. "IVF{}_HNSW32,PQ32x8") to let the server substitute the resolved
+    /// nLists; with a placeholder, --nlists is optional.
     #[arg(long)]
     pub factory: Option<String>,
+
+    /// Name for the created vector index. Defaults to a metric-derived name
+    /// (vector_cosine / vector_l2 / vector_dot). Set this to build several
+    /// indexes on one collection: load the data once, then re-run with
+    /// --only-vector and a distinct --index-name (and --factory/--nlists) per
+    /// index.
+    #[arg(long)]
+    pub index_name: Option<String>,
 
     /// Number of shards on the dataset collection.
     #[arg(long, default_value_t = 3)]

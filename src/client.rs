@@ -78,22 +78,6 @@ impl Client {
         Ok(value)
     }
 
-    pub fn drop_database_if_exists(&self, db: &str) -> Result<()> {
-        let url = self.url(&format!("/_db/_system/_api/database/{}", db));
-        let resp = self
-            .http
-            .delete(&url)
-            .basic_auth(&self.user, Some(&self.password))
-            .send()?;
-        if resp.status() == StatusCode::NOT_FOUND {
-            return Ok(());
-        }
-        if !resp.status().is_success() {
-            bail!("DELETE database {}: {}", db, resp.status());
-        }
-        Ok(())
-    }
-
     pub fn create_database(&self, db: &str) -> Result<()> {
         let body = json!({ "name": db });
         self.request(Method::POST, "/_db/_system/_api/database", Some(&body))?;
@@ -114,6 +98,22 @@ impl Client {
         let path = format!("/_db/{}/_api/collection", db);
         let body = json!({ "name": name, "numberOfShards": number_of_shards });
         self.request(Method::POST, &path, Some(&body))?;
+        Ok(())
+    }
+
+    pub fn drop_collection_if_exists(&self, db: &str, name: &str) -> Result<()> {
+        let url = self.url(&format!("/_db/{}/_api/collection/{}", db, name));
+        let resp = self
+            .http
+            .delete(&url)
+            .basic_auth(&self.user, Some(&self.password))
+            .send()?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        if !resp.status().is_success() {
+            bail!("DELETE collection {}: {}", name, resp.status());
+        }
         Ok(())
     }
 
