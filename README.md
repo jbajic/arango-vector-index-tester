@@ -52,6 +52,10 @@ vrecall setup --only-vector --nlists 256
 
 # Use a FAISS index_factory string (must resolve to an IVF index)
 vrecall setup --factory "IVF4096_HNSW32,PQ32x8" --nlists 4096
+
+# Templated factory: let the server fill the {} placeholder with the
+# auto-selected nLists (no --nlists needed)
+vrecall setup --factory "IVF{}_HNSW32,PQ32x8"
 ```
 
 Key flags:
@@ -63,7 +67,8 @@ Key flags:
 | `--dim`              | `768`        | Vector dimension (random mode only)                               |
 | `--ndocs`            | random: `200000` | Number of documents. HDF5 mode: all rows when omitted, else truncates |
 | `--nlists`           | auto         | IVF nLists (ArangoDB auto-selects when omitted)                   |
-| `--factory`          | —            | FAISS `index_factory` string (e.g. `IVF4096_HNSW32,PQ32x8`); requires `--nlists` to match |
+| `--factory`          | —            | FAISS `index_factory` string (e.g. `IVF4096_HNSW32,PQ32x8`). Concrete nlist requires a matching `--nlists`; a `{}` placeholder (e.g. `IVF{}_HNSW32,PQ32x8`) lets the server fill in the resolved nLists, making `--nlists` optional |
+| `--index-name`       | metric-derived | Name for the created index (`vector_cosine`/`_l2`/`_dot` by default) |
 | `--shards`           | `3`          | Collection shard count                                            |
 | `--seed`             | random       | Base RNG seed (random mode only); a fresh seed is printed if omitted |
 | `--batch`            | `5000`       | Documents per HTTP insert batch                                   |
@@ -96,6 +101,41 @@ Key flags:
 | `--retune`              | off                  | Force a fresh autotune run even if a persisted table covers the target |
 | `--gt-workers`          | `16`                 | Parallel workers for brute-force ground truth (collection mode only) |
 | `--index`               | *(first vector idx)* | Target a specific index by name                                       |
+
+### Comparing multiple indexes
+
+A collection can carry several vector indexes, and you can also spread datasets
+across several collections. `bench` benchmarks one index per run (`--index`),
+so the pattern is: build the indexes, then run `bench` once per index.
+
+**Several indexes on one collection** — load the data once, then add each index
+with `--only-vector` and a distinct `--index-name`:
+
+```bash
+# Load data + a default index
+vrecall setup --ann-dataset glove-100-angular
+
+# Add more indexes on the same data (no re-ingest)
+vrecall setup --only-vector --index-name ivf_pq   --factory "IVF{}_HNSW32,PQ32x8"
+vrecall setup --only-vector --index-name ivf_flat --factory "IVF{},Flat"
+
+# Benchmark each
+vrecall bench --index vector_cosine
+vrecall bench --index ivf_pq
+vrecall bench --index ivf_flat
+```
+
+**Indexes on different collections** — `setup` recreates only its target
+collection (creating the database if needed) and leaves sibling collections
+intact, so you can load several datasets into one database:
+
+```bash
+vrecall setup --coll glove   --ann-dataset glove-100-angular
+vrecall setup --coll sift    --ann-dataset sift-128-euclidean
+
+vrecall bench --coll glove --index vector_cosine
+vrecall bench --coll sift  --index vector_l2
+```
 
 ### Example output
 
