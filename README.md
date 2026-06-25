@@ -1,9 +1,10 @@
 # arango-embedding-dataset (`vrecall`)
 
 A command-line tool for benchmarking ArangoDB's cosine vector index recall.
-It loads a vector dataset (random or from an HDF5 file), inserts it into
-ArangoDB, builds a cosine IVF index, and then sweeps over `nProbe` values to
-measure recall@K and query throughput.
+It loads a vector dataset (random or from a downloaded ann-benchmarks dataset),
+inserts it into ArangoDB, builds a cosine IVF index, and then either sweeps over
+`nProbe` values or drives the index autotune `targetRecall` feature to measure
+recall@K and query throughput.
 
 ## Prerequisites
 
@@ -44,21 +45,30 @@ vrecall setup --ndocs 500000 --dim 128
 vrecall setup --ann-dataset glove-100-angular
 
 # Control index parameters
-vrecall setup --nlists 256 --train-iters 25 --shards 3
+vrecall setup --nlists 256 --shards 3
+
+# Re-create the index on already-loaded data without re-ingesting
+vrecall setup --only-vector --nlists 256
+
+# Use a FAISS index_factory string (must resolve to an IVF index)
+vrecall setup --factory "IVF4096_HNSW32,PQ32x8" --nlists 4096
 ```
 
 Key flags:
 
-| Flag                 | Default      | Description                                      |
-|----------------------|--------------|--------------------------------------------------|
-| `--ann-dataset`      | —            | Named ann-benchmarks dataset to auto-download    |
-| `--dim`              | `768`        | Vector dimension (random mode only)              |
-| `--ndocs`            | `200000`     | Number of documents to insert                    |
-| `--nlists`           | auto         | IVF nLists (ArangoDB auto-selects when omitted)  |
-| `--shards`           | `3`          | Collection shard count                           |
-| `--batch`            | `5000`       | Documents per HTTP insert batch                  |
-| `--workers`          | `16`         | Parallel insert workers                          |
-| `--index-timeout-sec`| `1800`       | Max seconds to wait for index ready state        |
+| Flag                 | Default      | Description                                                        |
+|----------------------|--------------|-------------------------------------------------------------------|
+| `--ann-dataset`      | —            | Named ann-benchmarks dataset to auto-download                     |
+| `--only-vector`      | off          | Skip ingestion; only (re)create the index on existing data        |
+| `--dim`              | `768`        | Vector dimension (random mode only)                               |
+| `--ndocs`            | random: `200000` | Number of documents. HDF5 mode: all rows when omitted, else truncates |
+| `--nlists`           | auto         | IVF nLists (ArangoDB auto-selects when omitted)                   |
+| `--factory`          | —            | FAISS `index_factory` string (e.g. `IVF4096_HNSW32,PQ32x8`); requires `--nlists` to match |
+| `--shards`           | `3`          | Collection shard count                                            |
+| `--seed`             | random       | Base RNG seed (random mode only); a fresh seed is printed if omitted |
+| `--batch`            | `5000`       | Documents per HTTP insert batch                                   |
+| `--workers`          | `16`         | Parallel insert workers                                           |
+| `--index-timeout-sec`| `1800`       | Max seconds to wait for index ready state                         |
 
 ### `bench` — measure recall and throughput
 
@@ -66,20 +76,26 @@ Key flags:
 # Use ground truth from the database (brute-force COSINE_SIMILARITY)
 vrecall bench --queries 25 --topk 1,10,50,100 --nprobes 1,8,32,128,512
 
-# Use pre-computed ground truth from ann-benchmarks HDF5
-vrecall bench --gt-file glove-100-angular.hdf5 --queries 100
+# Use pre-computed ground truth from a named ann-benchmarks dataset
+vrecall bench --ann-dataset glove-100-angular --queries 100
+
+# targetRecall (autotune) mode instead of the nProbe sweep
+vrecall bench --target-recall 0.95
 ```
 
 Key flags:
 
-| Flag            | Default              | Description                                              |
-|-----------------|----------------------|----------------------------------------------------------|
-| `--gt-file`     | —                    | HDF5 file with `test`, `neighbors`, `distances` arrays   |
-| `--queries`     | `25`                 | Number of query vectors                                  |
-| `--topk`        | `1,10,50,100`        | Recall cutoffs (comma-separated)                         |
-| `--nprobes`     | `1,8,32,128,512`     | nProbe values to sweep                                   |
-| `--gt-workers`  | `8`                  | Parallel workers for brute-force ground truth            |
-| `--index`       | *(first vector idx)* | Target a specific index by name                          |
+| Flag                    | Default              | Description                                                            |
+|-------------------------|----------------------|-----------------------------------------------------------------------|
+| `--ann-dataset`         | —                    | Named ann-benchmarks dataset to use for ground-truth queries          |
+| `--queries`             | `25`                 | Number of query vectors                                               |
+| `--topk`                | `1,10,50,100`        | Recall cutoffs (comma-separated)                                      |
+| `--nprobes`             | `1,8,32,128,512`     | nProbe values to sweep (ignored when `--target-recall` is set)        |
+| `--target-recall`       | —                    | Switch to autotune `targetRecall` mode; value in (0, 1]              |
+| `--autotune-timeout-sec`| `1800`               | Max seconds to wait for autotune (targetRecall mode only)            |
+| `--retune`              | off                  | Force a fresh autotune run even if a persisted table covers the target |
+| `--gt-workers`          | `16`                 | Parallel workers for brute-force ground truth (collection mode only) |
+| `--index`               | *(first vector idx)* | Target a specific index by name                                       |
 
 ### Example output
 
