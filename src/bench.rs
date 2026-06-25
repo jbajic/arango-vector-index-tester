@@ -352,15 +352,13 @@ fn wait_for_autotune_job(
         if let Some(v) = client.poll_job(db, job_id)? {
             return Ok(v);
         }
-        let elapsed = started.elapsed();
-        if elapsed.as_secs() >= timeout_sec {
+        if started.elapsed().as_secs() >= timeout_sec {
             bail!(
                 "autotune job {} did not finish within {}s",
                 job_id,
                 timeout_sec
             );
         }
-        println!("  ... still tuning ({:.0}s elapsed)", elapsed.as_secs_f64());
     }
 }
 
