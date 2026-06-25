@@ -97,7 +97,7 @@ Key flags:
 | `--topk`                | `1,10,50,100`        | Recall cutoffs (comma-separated)                                      |
 | `--nprobes`             | `1,8,32,128,512`     | nProbe values to sweep (ignored when `--target-recall` is set)        |
 | `--target-recall`       | —                    | Switch to autotune `targetRecall` mode; value in (0, 1]              |
-| `--autotune-timeout-sec`| `1800`               | Max seconds to wait for autotune (targetRecall mode only)            |
+| `--autotune-timeout-sec`| `3600`               | Max seconds to wait for autotune (targetRecall mode only)            |
 | `--retune`              | off                  | Force a fresh autotune run even if a persisted table covers the target |
 | `--gt-workers`          | `16`                 | Parallel workers for brute-force ground truth (collection mode only) |
 | `--index`               | *(first vector idx)* | Target a specific index by name                                       |

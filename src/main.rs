@@ -176,7 +176,7 @@ pub struct BenchArgs {
 
     /// How long to wait for autotune to populate the operating-point table, in
     /// seconds (targetRecall mode only).
-    #[arg(long, default_value_t = 1800)]
+    #[arg(long, default_value_t = 3600)]
     pub autotune_timeout_sec: u64,
 
     /// Force a fresh autotune run even when a persisted operating-point table
