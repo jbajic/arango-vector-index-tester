@@ -81,10 +81,34 @@ fn read_metric_attr(path: &Path) -> Result<Option<String>> {
     Ok(None)
 }
 
-fn open_vector_dataset(file: &hdf5::File) -> Result<(hdf5::Dataset, &'static str)> {
+struct VectorDataset {
+    ds: hdf5::Dataset,
+    name: &'static str,
+    rows: usize,
+    dim: usize,
+}
+
+// Open the file and return its 2D float32 vector dataset (`train`, else
+// `vectors`), validating the rank so callers get rows/dim directly.
+fn open_vector_dataset(path: &Path) -> Result<VectorDataset> {
+    let file =
+        hdf5::File::open(path).with_context(|| format!("opening HDF5 file {}", path.display()))?;
     for &name in VECTOR_DATASET_NAMES {
         if let Ok(ds) = file.dataset(name) {
-            return Ok((ds, name));
+            let shape = ds.shape();
+            if shape.len() != 2 {
+                bail!(
+                    "dataset '{}' is {}D, expected 2D (rows × dim)",
+                    name,
+                    shape.len()
+                );
+            }
+            return Ok(VectorDataset {
+                ds,
+                name,
+                rows: shape[0],
+                dim: shape[1],
+            });
         }
     }
     bail!(
@@ -156,7 +180,7 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: SetupArgs) -> Result
 
     if args.only_vector {
         let dim = match args.input.as_deref() {
-            Some(path) => read_dim_from_hdf5(path)?,
+            Some(path) => open_vector_dataset(path)?.dim,
             None => args.dim,
         };
         create_vector_index(client, db, coll, &args, dim, metric, &idx_name)?;
@@ -168,7 +192,7 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: SetupArgs) -> Result
 
     // Validate the HDF5 input before any destructive op on the database.
     if let Some(path) = args.input.as_deref() {
-        validate_vector_hdf5(path)?;
+        open_vector_dataset(path)?;
     }
 
     // Drop and recreate only the target collection, leaving any sibling
@@ -377,32 +401,6 @@ fn insert_random(client: &Client, db: &str, coll: &str, args: &SetupArgs) -> Res
     })
 }
 
-fn read_dim_from_hdf5(path: &Path) -> Result<usize> {
-    let file =
-        hdf5::File::open(path).with_context(|| format!("opening HDF5 file {}", path.display()))?;
-    let (ds, name) = open_vector_dataset(&file)?;
-    let shape = ds.shape();
-    if shape.len() != 2 {
-        bail!("dataset '{}' is {}D, expected 2D", name, shape.len());
-    }
-    Ok(shape[1])
-}
-
-fn validate_vector_hdf5(path: &Path) -> Result<()> {
-    let file =
-        hdf5::File::open(path).with_context(|| format!("opening HDF5 file {}", path.display()))?;
-    let (ds, name) = open_vector_dataset(&file)?;
-    let shape = ds.shape();
-    if shape.len() != 2 {
-        bail!(
-            "dataset '{}' is {}D, expected 2D (rows × dim)",
-            name,
-            shape.len()
-        );
-    }
-    Ok(())
-}
-
 fn insert_from_hdf5(
     client: &Client,
     db: &str,
@@ -410,19 +408,12 @@ fn insert_from_hdf5(
     args: &SetupArgs,
     path: &Path,
 ) -> Result<Inserted> {
-    let file =
-        hdf5::File::open(path).with_context(|| format!("opening HDF5 file {}", path.display()))?;
-    let (ds, ds_name) = open_vector_dataset(&file)?;
-    let shape = ds.shape();
-    if shape.len() != 2 {
-        bail!(
-            "dataset '{}' is {}D, expected 2D (rows × dim)",
-            ds_name,
-            shape.len()
-        );
-    }
-    let total_rows = shape[0];
-    let dim = shape[1];
+    let VectorDataset {
+        ds,
+        name: ds_name,
+        rows: total_rows,
+        dim,
+    } = open_vector_dataset(path)?;
     let n = match args.ndocs {
         Some(cap) => cap.min(total_rows),
         None => total_rows,
@@ -520,10 +511,7 @@ fn make_random_batch(start: usize, end: usize, dim: usize, base_seed: u64) -> Va
 // ground-truth neighbor ids, which reference positions in the source array.
 fn make_batch_from_rows(data: &Array2<f32>, row_offset: usize, start: usize, end: usize) -> Value {
     let docs: Vec<Value> = (start..end)
-        .map(|i| {
-            let v: Vec<f32> = data.row(i).iter().copied().collect();
-            json!({ "idx": row_offset + i, "vector": v })
-        })
+        .map(|i| json!({ "idx": row_offset + i, "vector": data.row(i).to_vec() }))
         .collect();
     Value::Array(docs)
 }
