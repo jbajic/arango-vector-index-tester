@@ -61,16 +61,26 @@ enum Cmd {
 
 #[derive(Args)]
 pub struct SetupArgs {
-    // Resolved HDF5 path; populated at runtime from --ann-dataset, never set by the user.
+    // Resolved HDF5 path; populated at runtime from --ann-dataset (a named
+    // dataset is downloaded, a file path is used directly). Not a CLI flag.
     #[arg(skip)]
     pub input: Option<PathBuf>,
 
-    /// Named ann-benchmarks dataset to download automatically. The file is
-    /// cached in ~/dataset-embeddings/ and reused on subsequent runs. One of:
-    /// deep-image-96-angular, fashion-mnist-784-euclidean, gist-960-euclidean,
-    /// glove-25-angular, glove-50-angular, glove-100-angular, glove-200-angular,
-    /// lastfm-64-dot, mnist-784-euclidean, nytimes-16-angular,
-    /// nytimes-256-angular, sift-128-euclidean.
+    /// Distance metric for the index: cosine, l2, or dot. Auto-detected from a
+    /// custom HDF5 file's `metric` attribute, or from a named --ann-dataset;
+    /// this flag overrides both. Defaults to cosine when nothing resolves it.
+    #[arg(long)]
+    pub metric: Option<String>,
+
+    /// Dataset to load: either the name of an ann-benchmarks dataset to
+    /// download (cached in ~/dataset-embeddings/) or a path to a local HDF5
+    /// (.h5/.hdf5) file. A custom file's base vectors are read from the `train`
+    /// dataset, falling back to `vectors`, as 2D float32; the file is streamed
+    /// in blocks, so multi-GB files load without being held in memory. Named
+    /// datasets: deep-image-96-angular, fashion-mnist-784-euclidean,
+    /// gist-960-euclidean, glove-25-angular, glove-50-angular,
+    /// glove-100-angular, glove-200-angular, lastfm-64-dot, mnist-784-euclidean,
+    /// nytimes-16-angular, nytimes-256-angular, sift-128-euclidean.
     #[arg(long)]
     pub ann_dataset: Option<String>,
 
@@ -136,16 +146,20 @@ pub struct SetupArgs {
 
 #[derive(Args)]
 pub struct BenchArgs {
-    // Resolved HDF5 path; populated at runtime from --ann-dataset, never set by the user.
+    // Resolved HDF5 path; populated at runtime from --ann-dataset (a named
+    // dataset is downloaded, a file path is used directly). Not a CLI flag.
     #[arg(skip)]
     pub gt_file: Option<PathBuf>,
 
-    /// Named ann-benchmarks dataset to use for ground-truth queries. The file
-    /// is cached in ~/dataset-embeddings/ and reused on subsequent runs. One of:
-    /// deep-image-96-angular, fashion-mnist-784-euclidean, gist-960-euclidean,
-    /// glove-25-angular, glove-50-angular, glove-100-angular, glove-200-angular,
-    /// lastfm-64-dot, mnist-784-euclidean, nytimes-16-angular,
-    /// nytimes-256-angular, sift-128-euclidean.
+    /// Ground-truth dataset for queries: either the name of an ann-benchmarks
+    /// dataset to download (cached in ~/dataset-embeddings/) or a path to a
+    /// local HDF5 (.h5/.hdf5) file with `test` (queries × dim) and `neighbors`
+    /// (queries × k) datasets, plus an optional `distances`. When omitted,
+    /// ground truth is computed from the collection by brute force. Named
+    /// datasets: deep-image-96-angular, fashion-mnist-784-euclidean,
+    /// gist-960-euclidean, glove-25-angular, glove-50-angular,
+    /// glove-100-angular, glove-200-angular, lastfm-64-dot, mnist-784-euclidean,
+    /// nytimes-16-angular, nytimes-256-angular, sift-128-euclidean.
     #[arg(long)]
     pub ann_dataset: Option<String>,
 

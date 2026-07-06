@@ -44,6 +44,13 @@ vrecall setup --ndocs 500000 --dim 128
 # Download a named ann-benchmarks dataset automatically (cached in ~/dataset-embeddings/)
 vrecall setup --ann-dataset glove-100-angular
 
+# ...or pass a path to a local HDF5 file (reads the `train` dataset, or `vectors`).
+# The file is streamed in blocks, so multi-GB files load without being held in memory.
+vrecall setup --ann-dataset ~/embeddings/mydata.h5
+
+# Metric is auto-detected from the file's `metric` attribute; override it explicitly
+vrecall setup --ann-dataset ~/embeddings/mydata.h5 --metric cosine
+
 # Control index parameters
 vrecall setup --nlists 256 --shards 3
 
@@ -62,7 +69,8 @@ Key flags:
 
 | Flag                 | Default      | Description                                                        |
 |----------------------|--------------|-------------------------------------------------------------------|
-| `--ann-dataset`      | —            | Named ann-benchmarks dataset to auto-download                     |
+| `--ann-dataset`      | —            | Dataset to load: a named ann-benchmarks dataset to auto-download, or a path to a local HDF5 file (reads `train`, else `vectors`; streamed in blocks) |
+| `--metric`           | auto/cosine  | Index metric (`cosine`/`l2`/`dot`). Auto-detected from a custom file's `metric` attribute or a named `--ann-dataset`; this flag overrides both |
 | `--only-vector`      | off          | Skip ingestion; only (re)create the index on existing data        |
 | `--dim`              | `768`        | Vector dimension (random mode only)                               |
 | `--ndocs`            | random: `200000` | Number of documents. HDF5 mode: all rows when omitted, else truncates |
@@ -75,6 +83,20 @@ Key flags:
 | `--workers`          | `16`         | Parallel insert workers                                           |
 | `--index-timeout-sec`| `1800`       | Max seconds to wait for index ready state                         |
 
+#### Custom HDF5 file layout
+
+For `setup`, a custom file needs a 2D `float32` base-vector dataset named `train`
+(ann-benchmarks convention) or `vectors`. Documents are stored as
+`{ idx: <row>, vector: [...] }`, where `idx` is the row's absolute position in the
+array (so it matches ground-truth neighbor ids). The file-level `metric` attribute
+(`cosine`/`l2`/`dot`, or the synonyms `angular`/`euclidean`/`ip`) is used when
+`--metric` is not given; dimension always comes from the dataset shape.
+
+For `bench`, a custom ground-truth file needs `test` (queries × dim) and `neighbors`
+(queries × k) datasets, plus an optional `distances` (queries × k) dataset. A
+base-only corpus (no `test`/`neighbors`) has no ground truth — benchmark it in
+collection mode by running `bench` without `--ann-dataset`.
+
 ### `bench` — measure recall and throughput
 
 ```bash
@@ -84,6 +106,9 @@ vrecall bench --queries 25 --topk 1,10,50,100 --nprobes 1,8,32,128,512
 # Use pre-computed ground truth from a named ann-benchmarks dataset
 vrecall bench --ann-dataset glove-100-angular --queries 100
 
+# ...or pass a path to a custom HDF5 ground-truth file (test/neighbors/distances)
+vrecall bench --ann-dataset ~/embeddings/mydata_gt.h5 --queries 100
+
 # targetRecall (autotune) mode instead of the nProbe sweep
 vrecall bench --target-recall 0.95
 ```
@@ -92,7 +117,7 @@ Key flags:
 
 | Flag                    | Default              | Description                                                            |
 |-------------------------|----------------------|-----------------------------------------------------------------------|
-| `--ann-dataset`         | —                    | Named ann-benchmarks dataset to use for ground-truth queries          |
+| `--ann-dataset`         | —                    | Ground-truth source: a named ann-benchmarks dataset, or a path to a local HDF5 file (`test` + `neighbors`, optional `distances`). When omitted, ground truth is computed from the collection |
 | `--queries`             | `25`                 | Number of query vectors                                               |
 | `--topk`                | `1,10,50,100`        | Recall cutoffs (comma-separated)                                      |
 | `--nprobes`             | `1,8,32,128,512`     | nProbe values to sweep (ignored when `--target-recall` is set)        |

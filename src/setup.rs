@@ -28,6 +28,72 @@ fn infer_metric(dataset_name: &str) -> &'static str {
     }
 }
 
+const VECTOR_DATASET_NAMES: &[&str] = &["train", "vectors"];
+
+fn normalize_metric(raw: &str) -> Result<&'static str> {
+    match raw.trim().to_lowercase().as_str() {
+        "cosine" | "angular" => Ok("cosine"),
+        "l2" | "euclidean" => Ok("l2"),
+        "dot" | "ip" | "inner_product" | "inner-product" => Ok("dot"),
+        other => bail!(
+            "unrecognized metric '{}'; use --metric cosine|l2|dot",
+            other
+        ),
+    }
+}
+
+fn resolve_metric(args: &SetupArgs) -> Result<&'static str> {
+    if let Some(ref m) = args.metric {
+        return normalize_metric(m);
+    }
+    if let Some(ref name) = args.ann_dataset {
+        if KNOWN_DATASETS.contains(&name.as_str()) {
+            return Ok(infer_metric(name));
+        }
+    }
+    if let Some(ref path) = args.input {
+        if let Some(raw) = read_metric_attr(path)? {
+            println!("Auto-detected metric '{}' from {}.", raw, path.display());
+            return normalize_metric(&raw);
+        }
+    }
+    Ok("cosine")
+}
+
+// h5py writes strings as variable-length UTF-8; older writers use ascii or
+// fixed-length, so try the common encodings before giving up.
+fn read_metric_attr(path: &Path) -> Result<Option<String>> {
+    let file =
+        hdf5::File::open(path).with_context(|| format!("opening HDF5 file {}", path.display()))?;
+    let attr = match file.attr("metric") {
+        Ok(a) => a,
+        Err(_) => return Ok(None),
+    };
+    if let Ok(s) = attr.read_scalar::<hdf5::types::VarLenUnicode>() {
+        return Ok(Some(s.as_str().to_string()));
+    }
+    if let Ok(s) = attr.read_scalar::<hdf5::types::VarLenAscii>() {
+        return Ok(Some(s.as_str().to_string()));
+    }
+    if let Ok(s) = attr.read_scalar::<hdf5::types::FixedAscii<64>>() {
+        return Ok(Some(s.as_str().to_string()));
+    }
+    Ok(None)
+}
+
+fn open_vector_dataset(file: &hdf5::File) -> Result<(hdf5::Dataset, &'static str)> {
+    for &name in VECTOR_DATASET_NAMES {
+        if let Ok(ds) = file.dataset(name) {
+            return Ok((ds, name));
+        }
+    }
+    bail!(
+        "HDF5 file has none of the expected vector datasets ({}); \
+         provide a 2D float32 dataset under one of those names",
+        VECTOR_DATASET_NAMES.join(", ")
+    )
+}
+
 fn index_name(metric: &str) -> &'static str {
     match metric {
         "l2" => "vector_l2",
@@ -71,19 +137,15 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: SetupArgs) -> Result
         }
     }
 
-    let metric = args
-        .ann_dataset
-        .as_deref()
-        .map(infer_metric)
-        .unwrap_or("cosine");
+    if let Some(ref name) = args.ann_dataset.clone() {
+        args.input = Some(ensure_dataset(name)?);
+    }
+
+    let metric = resolve_metric(&args)?;
     let idx_name = args
         .index_name
         .clone()
         .unwrap_or_else(|| index_name(metric).to_string());
-
-    if let Some(ref name) = args.ann_dataset.clone() {
-        args.input = Some(ensure_dataset(name)?);
-    }
 
     // Random mode: resolve the RNG seed, generating a fresh one when omitted.
     if args.input.is_none() {
@@ -106,7 +168,7 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: SetupArgs) -> Result
 
     // Validate the HDF5 input before any destructive op on the database.
     if let Some(path) = args.input.as_deref() {
-        validate_hdf5(path, "train")?;
+        validate_vector_hdf5(path)?;
     }
 
     // Drop and recreate only the target collection, leaving any sibling
@@ -139,10 +201,30 @@ fn dataset_cache_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join("dataset-embeddings"))
 }
 
+// A path has a separator or an HDF5 extension; named datasets are bare slugs.
+fn looks_like_path(arg: &str) -> bool {
+    let p = Path::new(arg);
+    p.is_absolute()
+        || arg.contains(std::path::MAIN_SEPARATOR)
+        || matches!(
+            p.extension().and_then(|e| e.to_str()),
+            Some("h5") | Some("hdf5")
+        )
+}
+
 pub fn ensure_dataset(name: &str) -> Result<PathBuf> {
+    if looks_like_path(name) {
+        let path = PathBuf::from(name);
+        if !path.is_file() {
+            bail!("HDF5 file '{}' not found", name);
+        }
+        println!("Using HDF5 file: {}", path.display());
+        return Ok(path);
+    }
     if !KNOWN_DATASETS.contains(&name) {
         bail!(
-            "Unknown ann-benchmarks dataset '{}'. Known datasets:\n  {}",
+            "Unknown ann-benchmarks dataset '{}'. Pass a path to a local HDF5 \
+             file, or one of the known datasets:\n  {}",
             name,
             KNOWN_DATASETS.join("\n  ")
         );
@@ -220,7 +302,7 @@ fn print_banner(args: &SetupArgs, db: &str, coll: &str, metric: &str, idx_name: 
     };
     let count_str = match (&args.input, args.ndocs) {
         (Some(_), Some(n)) => format!("up to {} rows", n),
-        (Some(_), None) => "all rows from the file".to_string(),
+        (Some(_), None) => "all rows".to_string(),
         (None, Some(n)) => format!("{} docs", n),
         (None, None) => format!("{} docs", DEFAULT_RANDOM_NDOCS),
     };
@@ -298,25 +380,23 @@ fn insert_random(client: &Client, db: &str, coll: &str, args: &SetupArgs) -> Res
 fn read_dim_from_hdf5(path: &Path) -> Result<usize> {
     let file =
         hdf5::File::open(path).with_context(|| format!("opening HDF5 file {}", path.display()))?;
-    let ds = file.dataset("train").context("opening dataset 'train'")?;
+    let (ds, name) = open_vector_dataset(&file)?;
     let shape = ds.shape();
     if shape.len() != 2 {
-        bail!("dataset 'train' is {}D, expected 2D", shape.len());
+        bail!("dataset '{}' is {}D, expected 2D", name, shape.len());
     }
     Ok(shape[1])
 }
 
-fn validate_hdf5(path: &Path, dataset_name: &str) -> Result<()> {
+fn validate_vector_hdf5(path: &Path) -> Result<()> {
     let file =
         hdf5::File::open(path).with_context(|| format!("opening HDF5 file {}", path.display()))?;
-    let ds = file
-        .dataset(dataset_name)
-        .with_context(|| format!("opening dataset '{}'", dataset_name))?;
+    let (ds, name) = open_vector_dataset(&file)?;
     let shape = ds.shape();
     if shape.len() != 2 {
         bail!(
             "dataset '{}' is {}D, expected 2D (rows × dim)",
-            dataset_name,
+            name,
             shape.len()
         );
     }
@@ -330,18 +410,14 @@ fn insert_from_hdf5(
     args: &SetupArgs,
     path: &Path,
 ) -> Result<Inserted> {
-    println!("Reading HDF5 file {} (dataset 'train')...", path.display());
-    let t_read = Instant::now();
     let file =
         hdf5::File::open(path).with_context(|| format!("opening HDF5 file {}", path.display()))?;
-    let ds = file
-        .dataset("train")
-        .with_context(|| format!("opening dataset '{}'", "train"))?;
+    let (ds, ds_name) = open_vector_dataset(&file)?;
     let shape = ds.shape();
     if shape.len() != 2 {
         bail!(
             "dataset '{}' is {}D, expected 2D (rows × dim)",
-            "train",
+            ds_name,
             shape.len()
         );
     }
@@ -352,40 +428,52 @@ fn insert_from_hdf5(
         None => total_rows,
     };
     println!(
+        "Reading HDF5 file {} (dataset '{}')...",
+        path.display(),
+        ds_name
+    );
+    println!(
         "  source: {} × {} float32; will insert {} rows",
         total_rows, dim, n
-    );
-
-    let data: Array2<f32> = ds
-        .read_slice_2d(s![..n, ..])
-        .with_context(|| format!("reading first {} rows of dataset '{}'", n, "train"))?;
-    let read_elapsed = t_read.elapsed();
-    println!(
-        "  loaded {:.1} MB in {:.1}s",
-        (n * dim * 4) as f64 / 1e6,
-        read_elapsed.as_secs_f64()
     );
 
     let pb = make_progress_bar(n as u64);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(args.workers)
         .build()?;
-    let batches: Vec<(usize, usize)> = batch_ranges(n, args.batch);
     let counter = AtomicU64::new(0);
     let pb_ref = &pb;
-    let data_ref = &data;
     let t_insert = Instant::now();
 
-    let result: Result<()> = pool.install(|| {
-        batches.into_par_iter().try_for_each(|(s, e)| {
-            let docs = make_batch_from_rows(data_ref, s, e);
-            client.insert_docs(db, coll, &docs)?;
-            let cur = counter.fetch_add((e - s) as u64, Ordering::Relaxed) + (e - s) as u64;
-            pb_ref.set_position(cur);
-            Ok::<_, anyhow::Error>(())
-        })
-    });
-    result?;
+    // Stream in blocks (the full array can be tens of GB); read each block
+    // sequentially since the HDF5 C library is not safe for concurrent reads,
+    // then insert its sub-batches in parallel.
+    let block_rows = args.batch.saturating_mul(args.workers).max(args.batch);
+    for block_start in (0..n).step_by(block_rows) {
+        let block_end = (block_start + block_rows).min(n);
+        let data: Array2<f32> = ds
+            .read_slice_2d(s![block_start..block_end, ..])
+            .with_context(|| {
+                format!(
+                    "reading rows {}..{} of dataset '{}'",
+                    block_start, block_end, ds_name
+                )
+            })?;
+        let data_ref = &data;
+        let counter_ref = &counter;
+        let local_batches: Vec<(usize, usize)> = batch_ranges(block_end - block_start, args.batch);
+        let result: Result<()> = pool.install(|| {
+            local_batches.into_par_iter().try_for_each(|(ls, le)| {
+                let docs = make_batch_from_rows(data_ref, block_start, ls, le);
+                client.insert_docs(db, coll, &docs)?;
+                let cur =
+                    counter_ref.fetch_add((le - ls) as u64, Ordering::Relaxed) + (le - ls) as u64;
+                pb_ref.set_position(cur);
+                Ok::<_, anyhow::Error>(())
+            })
+        });
+        result?;
+    }
     pb.finish_and_clear();
 
     let elapsed = t_insert.elapsed();
@@ -428,11 +516,13 @@ fn make_random_batch(start: usize, end: usize, dim: usize, base_seed: u64) -> Va
     Value::Array(docs)
 }
 
-fn make_batch_from_rows(data: &Array2<f32>, start: usize, end: usize) -> Value {
+// `idx` is the absolute row number (row_offset + local i) so it matches
+// ground-truth neighbor ids, which reference positions in the source array.
+fn make_batch_from_rows(data: &Array2<f32>, row_offset: usize, start: usize, end: usize) -> Value {
     let docs: Vec<Value> = (start..end)
         .map(|i| {
             let v: Vec<f32> = data.row(i).iter().copied().collect();
-            json!({ "idx": i, "vector": v })
+            json!({ "idx": row_offset + i, "vector": v })
         })
         .collect();
     Value::Array(docs)
