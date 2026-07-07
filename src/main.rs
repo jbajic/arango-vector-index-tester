@@ -163,6 +163,21 @@ pub struct BenchArgs {
     #[arg(long)]
     pub ann_dataset: Option<String>,
 
+    /// HDF5 file holding the query vectors, for datasets that keep queries in a
+    /// separate file from the ground truth (large "split" datasets do). Read
+    /// from dataset `test`, falling back to `vectors`. When omitted, the query
+    /// vectors are read from the --ann-dataset file itself (the ann-benchmarks
+    /// single-file layout).
+    #[arg(long)]
+    pub query_file: Option<PathBuf>,
+
+    /// Value added to each ground-truth neighbor id before matching it against
+    /// the collection's `idx`. ann-benchmarks ids are 0-based row numbers
+    /// (offset 0, the default). Datasets with 1-based ids need -1: e.g. HotpotQA
+    /// stores 1-based `chunk_id`s (`id == row + 1`), so pass `--gt-id-offset -1`.
+    #[arg(long, default_value_t = 0, allow_hyphen_values = true)]
+    pub gt_id_offset: i64,
+
     /// Number of query vectors to use. In collection mode: sampled from the
     /// collection. In --gt-file mode: truncates the test set.
     #[arg(long, default_value_t = 25)]

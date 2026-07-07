@@ -93,9 +93,26 @@ array (so it matches ground-truth neighbor ids). The file-level `metric` attribu
 `--metric` is not given; dimension always comes from the dataset shape.
 
 For `bench`, a custom ground-truth file needs `test` (queries × dim) and `neighbors`
-(queries × k) datasets, plus an optional `distances` (queries × k) dataset. A
-base-only corpus (no `test`/`neighbors`) has no ground truth — benchmark it in
-collection mode by running `bench` without `--ann-dataset`.
+(queries × k) datasets, plus an optional `distances` (queries × k) dataset (read as
+ann-benchmarks angular distance, i.e. cosine = 1 − distance). A base-only corpus
+(no `test`/`neighbors`) has no ground truth — benchmark it in collection mode by
+running `bench` without `--ann-dataset`.
+
+**Split / large datasets.** Large datasets often keep the base, queries, and ground
+truth in separate files (e.g. HotpotQA). `bench` handles this:
+- Queries in their own file → pass `--query-file` (read from `test`, else `vectors`).
+- Dimension-keyed ground truth → if there is no top-level `neighbors`, `bench` looks
+  for `large_<dim>/neighbors` and `large_<dim>/scores`, where `<dim>` is the query
+  dimension. `scores` are treated as **cosine similarities** (used as-is), not angular
+  distances.
+- 1-based neighbor ids → pass `--gt-id-offset -1`. Neighbor ids are matched against the
+  collection's `idx` (the 0-based source row set by `setup`). ann-benchmarks ids are
+  already 0-based (offset 0); HotpotQA stores 1-based `chunk_id`s (`id == row + 1`), so
+  it needs `-1`.
+
+> The ground truth must be computed at the **same dimension** as the index. HotpotQA's
+> `large_3072` group is valid only for a 3072-d index (the full base vectors); a
+> truncated-dimension index needs ground truth recomputed at that dimension.
 
 ### `bench` — measure recall and throughput
 
@@ -109,6 +126,11 @@ vrecall bench --ann-dataset glove-100-angular --queries 100
 # ...or pass a path to a custom HDF5 ground-truth file (test/neighbors/distances)
 vrecall bench --ann-dataset ~/embeddings/mydata_gt.h5 --queries 100
 
+# Split dataset with queries + ground truth in separate files (e.g. HotpotQA)
+vrecall bench --ann-dataset ~/Downloads/ML-dataset/hotpotqa_groundtruth.h5 \
+              --query-file  ~/Downloads/ML-dataset/hotpotqa_query.h5 \
+              --gt-id-offset -1 --queries 100 --topk 1,10,100
+
 # targetRecall (autotune) mode instead of the nProbe sweep
 vrecall bench --target-recall 0.95
 ```
@@ -117,7 +139,9 @@ Key flags:
 
 | Flag                    | Default              | Description                                                            |
 |-------------------------|----------------------|-----------------------------------------------------------------------|
-| `--ann-dataset`         | —                    | Ground-truth source: a named ann-benchmarks dataset, or a path to a local HDF5 file (`test` + `neighbors`, optional `distances`). When omitted, ground truth is computed from the collection |
+| `--ann-dataset`         | —                    | Ground-truth source: a named ann-benchmarks dataset, or a path to a local HDF5 file (`test` + `neighbors`, optional `distances`; or `large_<dim>/neighbors` + `scores`). When omitted, ground truth is computed from the collection |
+| `--query-file`          | —                    | Separate HDF5 file holding the query vectors (`test`, else `vectors`), for split datasets. When omitted, queries are read from `--ann-dataset` |
+| `--gt-id-offset`        | `0`                  | Value added to each neighbor id before matching the collection's `idx` (use `-1` for 1-based ids, e.g. HotpotQA `chunk_id`) |
 | `--queries`             | `25`                 | Number of query vectors                                               |
 | `--topk`                | `1,10,50,100`        | Recall cutoffs (comma-separated)                                      |
 | `--nprobes`             | `1,8,32,128,512`     | nProbe values to sweep (ignored when `--target-recall` is set)        |

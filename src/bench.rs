@@ -658,20 +658,43 @@ fn compute_gt_from_collection(
 
 fn load_gt_from_hdf5(path: &Path, args: &BenchArgs, max_k: usize) -> Result<Vec<Query>> {
     println!("\nReading ground truth from {} ...", path.display());
-    let file = hdf5::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let test_ds = file.dataset("test").context("opening dataset 'test'")?;
-    let nbrs_ds = file
-        .dataset("neighbors")
-        .context("opening dataset 'neighbors'")?;
 
+    // Query vectors live in a separate file for split datasets; otherwise in
+    // the ground-truth file itself. Read `test` (ann-benchmarks) or `vectors`.
+    let query_path = args.query_file.as_deref().unwrap_or(path);
+    let query_file = hdf5::File::open(query_path)
+        .with_context(|| format!("opening query file {}", query_path.display()))?;
+    let test_ds = open_first_dataset(&query_file, &["test", "vectors"])?;
     let test_shape = test_ds.shape();
+    if test_shape.len() != 2 {
+        bail!("query vectors must be 2D (queries × dim)");
+    }
+    let dim = test_shape[1];
+
+    // Ground truth: `neighbors`/`distances` at the top level (ann-benchmarks,
+    // where `distances` are angular = 1 − cos), or the dimension-keyed
+    // `large_<dim>/{neighbors,scores}` layout used by large split datasets like
+    // HotpotQA (where `scores` are cosine similarities, used as-is).
+    let file = hdf5::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let large = format!("large_{dim}");
+    let (nbrs_ds, score_ds_name, scores_are_cosine) = if let Ok(ds) = file.dataset("neighbors") {
+        (ds, "distances".to_string(), false)
+    } else if let Ok(ds) = file.dataset(&format!("{large}/neighbors")) {
+        (ds, format!("{large}/scores"), true)
+    } else {
+        bail!(
+            "no 'neighbors' or '{large}/neighbors' dataset in {}",
+            path.display()
+        );
+    };
+
     let nbrs_shape = nbrs_ds.shape();
-    if test_shape.len() != 2 || nbrs_shape.len() != 2 {
-        bail!("test and neighbors must both be 2D");
+    if nbrs_shape.len() != 2 {
+        bail!("neighbors must be 2D (queries × k)");
     }
     if test_shape[0] != nbrs_shape[0] {
         bail!(
-            "row count mismatch: test={} vs neighbors={}",
+            "row count mismatch: queries={} vs neighbors={}",
             test_shape[0],
             nbrs_shape[0]
         );
@@ -679,40 +702,49 @@ fn load_gt_from_hdf5(path: &Path, args: &BenchArgs, max_k: usize) -> Result<Vec<
     let truth_k = nbrs_shape[1];
     if truth_k < max_k {
         bail!(
-            "--ks asks for top-{} but 'neighbors' only has {} per query",
+            "--topk asks for top-{} but 'neighbors' only has {} per query",
             max_k,
             truth_k
         );
     }
     let n_queries = test_shape[0].min(args.queries);
-    let dim = test_shape[1];
+    let offset = args.gt_id_offset;
     println!(
-        "  test:      {} × {} float32 ({} used)",
-        test_shape[0], dim, n_queries
+        "  queries:   {} × {} float32 from {} ({} used)",
+        test_shape[0],
+        dim,
+        query_path.display(),
+        n_queries
     );
     println!(
-        "  neighbors: {} × {} int (truncating to top-{})",
-        nbrs_shape[0], truth_k, max_k
+        "  neighbors: {} × {} int (top-{}, id offset {})",
+        nbrs_shape[0], truth_k, max_k, offset
     );
 
     let test_vectors: Array2<f32> = test_ds
         .read_slice_2d(s![..n_queries, ..])
-        .context("reading dataset 'test'")?;
+        .context("reading query vectors")?;
     let neighbors: Array2<i64> =
-        read_int_matrix(&nbrs_ds, n_queries, max_k).context("reading dataset 'neighbors'")?;
+        read_int_matrix(&nbrs_ds, n_queries, max_k).context("reading neighbors")?;
 
-    let distances: Option<Array2<f32>> = match file.dataset("distances") {
+    let scores: Option<Array2<f32>> = match file.dataset(&score_ds_name) {
         Ok(ds) => {
             let shape = ds.shape();
             if shape.len() != 2 || shape[0] != test_shape[0] || shape[1] != truth_k {
-                println!("  distances: shape mismatch ({:?}), ignoring", shape);
+                println!(
+                    "  {}: shape mismatch ({:?}), ignoring",
+                    score_ds_name, shape
+                );
                 None
             } else {
                 Some(ds.read_slice_2d(s![..n_queries, ..max_k])?)
             }
         }
         Err(_) => {
-            println!("  distances: dataset not present; sim-loss will be empty");
+            println!(
+                "  {}: dataset not present; sim-loss will be empty",
+                score_ds_name
+            );
             None
         }
     };
@@ -722,10 +754,16 @@ fn load_gt_from_hdf5(path: &Path, args: &BenchArgs, max_k: usize) -> Result<Vec<
         let vector: Vec<f32> = test_vectors.row(i).iter().copied().collect();
         let truth: Vec<(i64, Option<f64>)> = (0..max_k)
             .map(|j| {
-                let id = neighbors[[i, j]];
-                let sim = distances
-                    .as_ref()
-                    .map(|d| angular_dist_to_cos_sim(d[[i, j]]) as f64);
+                let id = neighbors[[i, j]] + offset;
+                let sim = scores.as_ref().map(|d| {
+                    let raw = d[[i, j]];
+                    let cos = if scores_are_cosine {
+                        raw
+                    } else {
+                        angular_dist_to_cos_sim(raw)
+                    };
+                    cos as f64
+                });
                 (id, sim)
             })
             .collect();
@@ -737,6 +775,17 @@ fn load_gt_from_hdf5(path: &Path, args: &BenchArgs, max_k: usize) -> Result<Vec<
         max_k
     );
     Ok(queries)
+}
+
+/// Open the first of `names` that exists in `file`. Names may be nested paths
+/// (e.g. "large_3072/neighbors").
+fn open_first_dataset(file: &hdf5::File, names: &[&str]) -> Result<hdf5::Dataset> {
+    for &name in names {
+        if let Ok(ds) = file.dataset(name) {
+            return Ok(ds);
+        }
+    }
+    bail!("none of the datasets {:?} were found", names)
 }
 
 /// HDF5 neighbor arrays may be int32 or int64. Read either, return as i64.
