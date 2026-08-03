@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 mod bench;
@@ -144,6 +144,20 @@ pub struct SetupArgs {
     pub index_timeout_sec: u64,
 }
 
+/// How the approx query measurement is driven.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum BenchMode {
+    /// Serial: one query at a time through a single client, so each query's time
+    /// is measured with no contention. Best for clean per-query latency; the
+    /// reported QPS is just single-client throughput (1000 / latency).
+    Latency,
+    /// Concurrent: `--clients` independent clients issue queries in parallel to
+    /// saturate the server. Best for aggregate throughput (QPS); the reported
+    /// latency is per-query time *under load* and will be higher than in latency
+    /// mode. Both modes report both latency and QPS.
+    Qps,
+}
+
 #[derive(Args)]
 pub struct BenchArgs {
     // Resolved HDF5 path; populated at runtime from --ann-dataset (a named
@@ -215,9 +229,21 @@ pub struct BenchArgs {
     pub retune: bool,
 
     /// Parallel workers for the ground-truth pass (collection mode only).
-    /// The approx sweep stays serial so per-query timings are meaningful.
     #[arg(long, default_value_t = 16)]
     pub gt_workers: usize,
+
+    /// How to drive the approx query measurement. `latency` runs queries
+    /// serially through a single client for clean, contention-free per-query
+    /// timings. `qps` runs `--clients` independent clients concurrently to
+    /// measure aggregate throughput (latency then reflects time under load).
+    /// Both modes report both latency and QPS.
+    #[arg(long, value_enum, default_value_t = BenchMode::Latency)]
+    pub mode: BenchMode,
+
+    /// Number of independent concurrent clients to use in `--mode qps`
+    /// (ignored in latency mode). Each client has its own HTTP connection pool.
+    #[arg(long, default_value_t = 16)]
+    pub clients: usize,
 
     /// Name of the vector index to use. When omitted the first vector index
     /// found on the collection is used. Pass this when the collection has

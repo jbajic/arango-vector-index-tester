@@ -36,6 +36,13 @@ impl Client {
         })
     }
 
+    /// Build an independent client sharing this one's connection parameters but
+    /// with its own HTTP connection pool. Used to spin up N genuinely separate
+    /// clients for the concurrent (qps) benchmark mode.
+    pub fn try_clone(&self) -> Result<Self> {
+        Client::new(&self.endpoint, &self.user, &self.password)
+    }
+
     pub fn endpoint(&self) -> &str {
         &self.endpoint
     }

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::client::{AsyncSubmission, Client};
 use crate::setup::ensure_dataset;
-use crate::BenchArgs;
+use crate::{BenchArgs, BenchMode};
 
 struct Query {
     vector: Vec<f32>,
@@ -23,12 +23,227 @@ struct NProbeResult {
     nprobe: u64,
     recall: Vec<f64>,
     sim_loss: Vec<Option<f64>>,
-    avg_time_ms: f64,
+    timing: QueryTiming,
+    latency_buckets: Vec<LatencyBucket>,
+}
+
+/// Mean recall@K of the queries whose per-query latency fell in one percentile
+/// band. Reveals whether the slowest queries also recall worse.
+struct LatencyBucket {
+    /// Upper edge of the band, e.g. "p95".
+    label: &'static str,
+    /// Latency (ms) at the upper edge of this band.
+    edge_ms: f64,
+    /// Number of queries in the band.
+    count: usize,
+    /// Mean recall@K (one entry per K) over the queries in the band.
+    recall: Vec<f64>,
+}
+
+/// Percentile band edges used for the latency-bucket recall breakdown.
+const LATENCY_BANDS: &[(&str, f64, f64)] = &[
+    ("p50", 0.0, 50.0),
+    ("p90", 50.0, 90.0),
+    ("p95", 90.0, 95.0),
+    ("p99", 95.0, 99.0),
+    ("p100", 99.0, 100.0),
+];
+
+/// Partition queries into latency percentile bands and compute the mean
+/// recall@K within each. `latencies_ms[i]` and `per_query_recall[i]` describe
+/// the same query i (index-aligned). Empty bands are omitted.
+fn latency_bucket_recall(
+    latencies_ms: &[f64],
+    per_query_recall: &[Vec<f64>],
+    n_ks: usize,
+) -> Vec<LatencyBucket> {
+    let n = latencies_ms.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        latencies_ms[a]
+            .partial_cmp(&latencies_ms[b])
+            .expect("latency is never NaN")
+    });
+    let edge = |p: f64| ((p / 100.0) * n as f64).round() as usize;
+
+    let mut buckets = Vec::new();
+    for &(label, lo, hi) in LATENCY_BANDS {
+        let start = edge(lo).min(n);
+        let end = edge(hi).clamp(start, n);
+        let band = &order[start..end];
+        if band.is_empty() {
+            continue;
+        }
+        let recall: Vec<f64> = (0..n_ks)
+            .map(|k| band.iter().map(|&i| per_query_recall[i][k]).sum::<f64>() / band.len() as f64)
+            .collect();
+        buckets.push(LatencyBucket {
+            label,
+            edge_ms: latencies_ms[order[end - 1]],
+            count: band.len(),
+            recall,
+        });
+    }
+    buckets
+}
+
+/// Timing summary for one measurement pass. Latency fields are computed from
+/// the individually measured per-query times (mean plus the p50/p90/p95/p99
+/// tail); `qps` is throughput, computed differently per mode (see
+/// `execute_queries`).
+struct QueryTiming {
+    mean_latency_ms: f64,
+    p50_ms: f64,
+    p90_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+    qps: f64,
+}
+
+impl QueryTiming {
+    fn empty() -> Self {
+        QueryTiming {
+            mean_latency_ms: 0.0,
+            p50_ms: 0.0,
+            p90_ms: 0.0,
+            p95_ms: 0.0,
+            p99_ms: 0.0,
+            qps: 0.0,
+        }
+    }
+
+    /// Summarize per-query latencies (ms). `qps` is passed in because it is
+    /// derived differently per mode (single-client 1000/mean vs aggregate
+    /// n/wall-clock).
+    fn from_latencies(latencies_ms: &[f64], qps: f64) -> Self {
+        if latencies_ms.is_empty() {
+            return Self::empty();
+        }
+        let mean_latency_ms = latencies_ms.iter().sum::<f64>() / latencies_ms.len() as f64;
+        let mut sorted = latencies_ms.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).expect("latency is never NaN"));
+        QueryTiming {
+            mean_latency_ms,
+            p50_ms: percentile(&sorted, 50.0),
+            p90_ms: percentile(&sorted, 90.0),
+            p95_ms: percentile(&sorted, 95.0),
+            p99_ms: percentile(&sorted, 99.0),
+            qps,
+        }
+    }
+}
+
+/// Nearest-rank percentile of ascending-sorted `sorted` (must be non-empty),
+/// with `p` in [0, 100]. Returns the sample at rank ceil(p/100 * n).
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    let n = sorted.len();
+    let rank = ((p / 100.0) * n as f64).ceil() as usize;
+    let idx = rank.clamp(1, n) - 1;
+    sorted[idx]
 }
 
 /// Per-query measurement for one nProbe value: (recall@K for each K,
 /// similarity-loss@K for each K).
 type PerQueryStats = (Vec<f64>, Vec<Option<f64>>);
+
+/// Run `run_one` for every query and return the per-query results together with
+/// the per-query latencies (ms) — both in the original query order, so the two
+/// vectors are index-aligned — and a timing summary.
+///
+/// In `Latency` mode the queries run serially through a single client so each
+/// call is timed without contention; QPS is the single-client throughput
+/// (1000 / mean latency). In `Qps` mode the query indices are partitioned into
+/// `clients` contiguous ranges, each run by its own independent client on a
+/// dedicated thread; QPS is the true aggregate throughput (n / wall-clock) and
+/// the reported latency is the mean per-query time under concurrent load.
+///
+/// The shared `queries` slice is borrowed read-only and each worker keeps its
+/// own results locally, so no synchronized/concurrent data structures are used.
+fn execute_queries<T, F>(
+    queries: &[Query],
+    mode: BenchMode,
+    clients: usize,
+    make_client: &(dyn Fn() -> Result<Client> + Sync),
+    run_one: F,
+) -> Result<(Vec<T>, Vec<f64>, QueryTiming)>
+where
+    T: Send,
+    F: Fn(&Client, &Query) -> Result<T> + Sync,
+{
+    let n = queries.len();
+    if n == 0 {
+        return Ok((Vec::new(), Vec::new(), QueryTiming::empty()));
+    }
+
+    if mode == BenchMode::Latency {
+        let client = make_client()?;
+        let mut results = Vec::with_capacity(n);
+        let mut latencies_ms = Vec::with_capacity(n);
+        for q in queries {
+            let t = Instant::now();
+            results.push(run_one(&client, q)?);
+            latencies_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        let mean = latencies_ms.iter().sum::<f64>() / n as f64;
+        let qps = if mean > 0.0 { 1000.0 / mean } else { 0.0 };
+        let timing = QueryTiming::from_latencies(&latencies_ms, qps);
+        return Ok((results, latencies_ms, timing));
+    }
+
+    // Qps mode: static contiguous partition of query indices, one client per
+    // worker thread. Larger remainders go to the first `rem` workers.
+    let n_workers = clients.max(1).min(n);
+    let base = n / n_workers;
+    let rem = n % n_workers;
+    let mut ranges = Vec::with_capacity(n_workers);
+    let mut start = 0;
+    for w in 0..n_workers {
+        let len = base + usize::from(w < rem);
+        ranges.push(start..start + len);
+        start += len;
+    }
+
+    let run_one = &run_one;
+    let wall = Instant::now();
+    let worker_results: Result<Vec<Vec<(usize, T, f64)>>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = ranges
+            .into_iter()
+            .map(|range| {
+                scope.spawn(move || -> Result<Vec<(usize, T, f64)>> {
+                    let client = make_client()?;
+                    let mut local = Vec::with_capacity(range.len());
+                    for i in range {
+                        let t = Instant::now();
+                        let r = run_one(&client, &queries[i])?;
+                        let latency_ms = t.elapsed().as_secs_f64() * 1000.0;
+                        local.push((i, r, latency_ms));
+                    }
+                    Ok(local)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("benchmark worker thread panicked"))
+            .collect()
+    });
+    let wall_secs = wall.elapsed().as_secs_f64();
+
+    let mut indexed: Vec<(usize, T, f64)> = worker_results?.into_iter().flatten().collect();
+    indexed.sort_by_key(|(i, _, _)| *i);
+    let latencies_ms: Vec<f64> = indexed.iter().map(|(_, _, l)| *l).collect();
+    let results: Vec<T> = indexed.into_iter().map(|(_, r, _)| r).collect();
+    let qps = if wall_secs > 0.0 {
+        n as f64 / wall_secs
+    } else {
+        0.0
+    };
+    let timing = QueryTiming::from_latencies(&latencies_ms, qps);
+    Ok((results, latencies_ms, timing))
+}
 
 pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result<()> {
     if let Some(ref name) = args.ann_dataset.clone() {
@@ -142,15 +357,17 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result
         compute_gt_from_collection(client, db, coll, &args, max_k)?
     };
 
+    let make_client = || client.try_clone();
     let mut results: Vec<NProbeResult> = Vec::with_capacity(nprobes.len());
     for &nprobe in &nprobes {
-        println!("\nMeasuring approx with nProbe={}...", nprobe);
-        let t0 = Instant::now();
-        let per_query: Result<Vec<PerQueryStats>> = queries
-            .iter()
-            .map(|q| {
-                let approx =
-                    run_approx_topk(client, db, coll, &q.vector, max_k, nprobe, &index_name)?;
+        println!(
+            "\nMeasuring approx with nProbe={} ({})...",
+            nprobe,
+            mode_label(args.mode, args.clients)
+        );
+        let (per_query, latencies, timing): (Vec<PerQueryStats>, Vec<f64>, QueryTiming) =
+            execute_queries(&queries, args.mode, args.clients, &make_client, |c, q| {
+                let approx = run_approx_topk(c, db, coll, &q.vector, max_k, nprobe, &index_name)?;
                 let recall: Vec<f64> = ks
                     .iter()
                     .map(|&k| recall_at_k(&q.truth, &approx, k))
@@ -160,11 +377,8 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result
                     .map(|&k| sim_loss_at_k(&q.truth, &approx, k))
                     .collect();
                 Ok((recall, sim_loss))
-            })
-            .collect();
-        let per_query = per_query?;
+            })?;
         let n = per_query.len() as f64;
-        let elapsed_ms = t0.elapsed().as_millis() as f64 / n;
         let recall_avg: Vec<f64> = (0..ks.len())
             .map(|i| per_query.iter().map(|(r, _)| r[i]).sum::<f64>() / n)
             .collect();
@@ -178,16 +392,37 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result
                 }
             })
             .collect();
+        let per_query_recall: Vec<Vec<f64>> = per_query.iter().map(|(r, _)| r.clone()).collect();
+        let latency_buckets = latency_bucket_recall(&latencies, &per_query_recall, ks.len());
         results.push(NProbeResult {
             nprobe,
             recall: recall_avg,
             sim_loss: sim_loss_avg,
-            avg_time_ms: elapsed_ms,
+            timing,
+            latency_buckets,
         });
     }
 
-    print_report(count, dimension, nlists, &index_name, &ks, &results);
+    print_report(
+        count,
+        dimension,
+        nlists,
+        &index_name,
+        &ks,
+        &results,
+        args.mode,
+        args.clients,
+    );
     Ok(())
+}
+
+/// Short human-readable description of how the measurement is driven, for
+/// banners and progress lines.
+fn mode_label(mode: BenchMode, clients: usize) -> String {
+    match mode {
+        BenchMode::Latency => "latency mode: 1 client, serial".to_string(),
+        BenchMode::Qps => format!("qps mode: {} concurrent clients", clients),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -239,28 +474,26 @@ fn run_target_recall(
     };
 
     println!(
-        "\nRunning {} queries with targetRecall={:.3} (serial, for clean timings)...",
+        "\nRunning {} queries with targetRecall={:.3} ({})...",
         queries.len(),
-        target
+        target,
+        mode_label(args.mode, args.clients)
     );
-    let t0 = Instant::now();
-    let per_query: Result<Vec<Vec<f64>>> = queries
-        .iter()
-        .map(|q| {
+    let make_client = || client.try_clone();
+    let (per_query, latencies, timing): (Vec<Vec<f64>>, Vec<f64>, QueryTiming) =
+        execute_queries(&queries, args.mode, args.clients, &make_client, |c, q| {
             let approx =
-                run_approx_target_recall(client, db, coll, &q.vector, max_k, target, index_name)?;
+                run_approx_target_recall(c, db, coll, &q.vector, max_k, target, index_name)?;
             Ok(ks
                 .iter()
                 .map(|&k| recall_at_k(&q.truth, &approx, k))
                 .collect())
-        })
-        .collect();
-    let per_query = per_query?;
+        })?;
     let n = per_query.len();
     if n == 0 {
         bail!("no query vectors available");
     }
-    let avg_time_ms = t0.elapsed().as_millis() as f64 / n as f64;
+    let latency_buckets = latency_bucket_recall(&latencies, &per_query, ks.len());
 
     print_target_recall_report(
         count,
@@ -270,7 +503,8 @@ fn run_target_recall(
         ks,
         target,
         &per_query,
-        avg_time_ms,
+        &timing,
+        &latency_buckets,
     );
     Ok(())
 }
@@ -449,6 +683,7 @@ fn print_banner_target_recall(
         "    {{targetRecall: {}}} and count query points below the target.",
         target
     );
+    println!("  - Measurement: {}", mode_label(args.mode, args.clients));
     println!();
 }
 
@@ -461,7 +696,8 @@ fn print_target_recall_report(
     ks: &[usize],
     target: f64,
     per_query: &[Vec<f64>],
-    avg_time_ms: f64,
+    timing: &QueryTiming,
+    latency_buckets: &[LatencyBucket],
 ) {
     let n = per_query.len();
     println!();
@@ -485,14 +721,47 @@ fn print_target_recall_report(
             k, mean, min, fails, n, fail_pct
         );
     }
-    let qps = 1000.0 / avg_time_ms;
     println!();
     println!(
-        "Per-query latency: {:.1} ms ({:.1} QPS). \"below target\" counts queries whose",
-        avg_time_ms, qps
+        "Latency (ms): mean {:.1} | p50 {:.1} | p90 {:.1} | p95 {:.1} | p99 {:.1}  |  throughput: {:.1} QPS.",
+        timing.mean_latency_ms,
+        timing.p50_ms,
+        timing.p90_ms,
+        timing.p95_ms,
+        timing.p99_ms,
+        timing.qps
     );
-    println!("achieved recall@K fell under the requested targetRecall.");
+    println!(
+        "\"below target\" counts queries whose achieved recall@K fell under the requested targetRecall."
+    );
+    if !latency_buckets.is_empty() {
+        println!();
+        println!("Recall by per-query latency band (do slower queries recall worse?):");
+        print_latency_bucket_recall(ks, latency_buckets);
+    }
     println!();
+}
+
+/// Print the "recall by per-query latency band" table: one row per latency
+/// percentile band, showing how many queries fell in it, the latency at its
+/// upper edge, and the mean recall@K of those queries.
+fn print_latency_bucket_recall(ks: &[usize], buckets: &[LatencyBucket]) {
+    if buckets.is_empty() {
+        return;
+    }
+    let mut header = String::from("  band | up to ms | queries |");
+    for k in ks {
+        header.push_str(&format!(" recall@{:>3} |", k));
+    }
+    println!("{}", header);
+    println!("{}", "-".repeat(header.len()));
+    for b in buckets {
+        print!("  {:<4} | {:>8.1} | {:>7} |", b.label, b.edge_ms, b.count);
+        for r in &b.recall {
+            print!("     {:>6.3} |", r);
+        }
+        println!();
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -525,7 +794,7 @@ fn print_banner(
     println!("  - Query vectors: {}", args.queries);
     println!("  - Recall cutoffs K: {:?}", ks);
     println!("  - nProbe sweep: {:?}", nprobes);
-    println!("  - Approx queries run serially per nProbe so per-query timings are clean.");
+    println!("  - Measurement: {}", mode_label(args.mode, args.clients));
     println!();
 }
 
@@ -922,6 +1191,7 @@ fn sim_loss_at_k(truth: &[(i64, Option<f64>)], approx: &[(i64, f64)], k: usize) 
     Some(truth_sum / count as f64 - approx_sum / take as f64)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_report(
     count: u64,
     dim: u64,
@@ -929,28 +1199,59 @@ fn print_report(
     index_name: &str,
     ks: &[usize],
     results: &[NProbeResult],
+    mode: BenchMode,
+    clients: usize,
 ) {
     println!();
     println!("================================================================");
     println!("Cosine recall report");
     println!("  dataset:    {} vectors, dim={}", count, dim);
     println!("  index:      '{}' (nLists={})", index_name, nlists);
+    println!("  measured:   {}", mode_label(mode, clients));
     println!("================================================================");
+    println!("Recall vs latency tradeoff: each nProbe is one operating point (higher");
+    println!("nProbe trades latency for recall). Compare against ann-benchmarks-style");
+    println!("recall / p95-latency curves.");
+    println!();
 
-    print!("nProbe |");
+    let mut header = String::from("nProbe |");
     for k in ks {
-        print!(" recall@{:>3} |", k);
+        header.push_str(&format!(" recall@{:>3} |", k));
     }
-    println!("  time(ms) |     QPS");
-    let total_width = 8 + ks.len() * 13 + 22;
-    println!("{}", "-".repeat(total_width));
+    header.push_str(" mean_ms |    p50 |    p90 |    p95 |    p99 |      QPS");
+    println!("{}", header);
+    println!("{}", "-".repeat(header.len()));
     for r in results {
         print!(" {:>4}  |", r.nprobe);
         for v in &r.recall {
             print!("     {:>6.3} |", v);
         }
-        let qps = 1000.0 / r.avg_time_ms;
-        println!("  {:>7.1}   | {:>7.1}", r.avg_time_ms, qps);
+        let t = &r.timing;
+        println!(
+            " {:>7.1} | {:>6.1} | {:>6.1} | {:>6.1} | {:>6.1} | {:>8.1}",
+            t.mean_latency_ms, t.p50_ms, t.p90_ms, t.p95_ms, t.p99_ms, t.qps
+        );
+    }
+    match mode {
+        BenchMode::Latency => println!(
+            "\nlatency columns = isolated per-query time (ms); QPS = single-client throughput (1000/mean)."
+        ),
+        BenchMode::Qps => println!(
+            "\nlatency columns = per-query time (ms) under load; QPS = aggregate throughput across {} clients.",
+            clients
+        ),
+    }
+
+    if results.iter().any(|r| !r.latency_buckets.is_empty()) {
+        println!();
+        println!("Recall by per-query latency band (do slower queries recall worse?):");
+        for r in results {
+            if r.latency_buckets.is_empty() {
+                continue;
+            }
+            println!("nProbe={}:", r.nprobe);
+            print_latency_bucket_recall(ks, &r.latency_buckets);
+        }
     }
 
     let any_sim_loss = results
