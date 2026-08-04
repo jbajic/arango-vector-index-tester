@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::client::{AsyncSubmission, Client};
 use crate::plan;
-use crate::setup::ensure_dataset;
+use crate::setup::{ensure_dataset, is_ready};
 use crate::{BenchArgs, BenchMode};
 
 struct Query {
@@ -29,15 +29,17 @@ struct IndexInfo {
     dimension: u64,
     /// Resolved IVF nLists of the index.
     nlists: u64,
+    /// Distance metric of the index (cosine or l2).
+    metric: Metric,
     /// Index name.
     name: String,
     /// Full index handle ("collection/id"), used for the autotune endpoints.
     id: String,
 }
 
-/// Distance metric of the index under test. The vector-graph index supports
-/// cosine and l2; both the query direction and the exact ground-truth function
-/// depend on it.
+/// Distance metric of the index under test. Both the IVF and vector-graph
+/// indexes support cosine and l2; the query function, the sort direction, and
+/// the exact ground-truth function all depend on it.
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum Metric {
     Cosine,
@@ -50,7 +52,8 @@ impl Metric {
             "cosine" => Ok(Metric::Cosine),
             "l2" => Ok(Metric::L2),
             other => bail!(
-                "vector-graph bench supports metric cosine or l2, got '{}'",
+                "bench supports metric cosine or l2, got '{}'. (An IVF index \
+                 built with metric dot is not supported by bench.)",
                 other
             ),
         }
@@ -407,6 +410,26 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result
         return run_graph_bench(client, db, coll, &args, &graph, &ks);
     }
 
+    // An IVF index must have trained before it can be queried. Catch the
+    // untrained/unusable case here with an actionable message rather than
+    // letting it surface later as a confusing "nLists=0" clamp.
+    if !is_ready(vec_idx) {
+        let state = vec_idx["trainingState"].as_str().unwrap_or("unknown");
+        let detail = vec_idx["errorMessage"]
+            .as_str()
+            .map(|m| format!(": {m}"))
+            .unwrap_or_default();
+        bail!(
+            "IVF index '{}' is not trained (trainingState={}){}. Re-run \
+             `vrecall setup` — an IVF index needs at least as many documents \
+             as clusters to train, and the collection currently holds {} docs.",
+            index_name,
+            state,
+            detail,
+            count
+        );
+    }
+
     let nlists = vec_idx["params"]["nLists"]
         .as_u64()
         .or_else(|| vec_idx["resolvedNLists"].as_u64())
@@ -419,10 +442,16 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result
                 .find_map(|s| s["resolvedNLists"].as_u64())
         })
         .context("could not determine nLists from index definition")?;
+    let metric = Metric::parse(
+        vec_idx["params"]["metric"]
+            .as_str()
+            .context("IVF index has no metric")?,
+    )?;
     let info = IndexInfo {
         count,
         dimension,
         nlists,
+        metric,
         name: index_name,
         id: index_id,
     };
@@ -456,7 +485,7 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result
             client,
             db,
             info.dimension as usize,
-            &ivf_approx_query(coll, &info.name, max_k, sample_nprobe),
+            &ivf_approx_query(coll, &info.name, max_k, sample_nprobe, info.metric),
             &format!("nProbe: {}", sample_nprobe),
         )?;
     }
@@ -465,11 +494,10 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result
         return Ok(());
     }
 
-    // The IVF query path is cosine-only (APPROX_NEAR_COSINE / COSINE_SIMILARITY).
     let queries: Vec<Query> = if let Some(path) = args.gt_file.as_deref() {
-        load_gt_from_hdf5(path, &args, max_k, Metric::Cosine)?
+        load_gt_from_hdf5(path, &args, max_k, info.metric)?
     } else {
-        compute_gt_from_collection(client, db, coll, &args, max_k, Metric::Cosine)?
+        compute_gt_from_collection(client, db, coll, &args, max_k, info.metric)?
     };
 
     let make_client = || client.try_clone();
@@ -480,16 +508,17 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result
             nprobe,
             mode_label(args.mode, args.clients)
         );
+        let query = ivf_approx_query(coll, &info.name, max_k, nprobe, info.metric);
         let (per_query, latencies, timing): (Vec<PerQueryStats>, Vec<f64>, QueryTiming) =
             execute_queries(&queries, args.mode, args.clients, &make_client, |c, q| {
-                let approx = run_approx_topk(c, db, coll, &q.vector, max_k, nprobe, &info.name)?;
+                let approx = run_query(c, db, &query, &q.vector)?;
                 let recall: Vec<f64> = ks
                     .iter()
                     .map(|&k| recall_at_k(&q.truth, &approx, k))
                     .collect();
                 let sim_loss: Vec<Option<f64>> = ks
                     .iter()
-                    .map(|&k| sim_loss_at_k(&q.truth, &approx, k, Metric::Cosine))
+                    .map(|&k| sim_loss_at_k(&q.truth, &approx, k, info.metric))
                     .collect();
                 Ok((recall, sim_loss))
             })?;
@@ -547,7 +576,7 @@ fn run_target_recall(
             client,
             db,
             info.dimension as usize,
-            &ivf_target_query(coll, &info.name, max_k, target),
+            &ivf_target_query(coll, &info.name, max_k, target, info.metric),
             &format!("targetRecall: {}", target),
         )?;
     }
@@ -571,9 +600,9 @@ fn run_target_recall(
     )?;
 
     let queries: Vec<Query> = if let Some(path) = args.gt_file.as_deref() {
-        load_gt_from_hdf5(path, args, max_k, Metric::Cosine)?
+        load_gt_from_hdf5(path, args, max_k, info.metric)?
     } else {
-        compute_gt_from_collection(client, db, coll, args, max_k, Metric::Cosine)?
+        compute_gt_from_collection(client, db, coll, args, max_k, info.metric)?
     };
 
     println!(
@@ -583,10 +612,10 @@ fn run_target_recall(
         mode_label(args.mode, args.clients)
     );
     let make_client = || client.try_clone();
+    let query = ivf_target_query(coll, &info.name, max_k, target, info.metric);
     let (per_query, latencies, timing): (Vec<Vec<f64>>, Vec<f64>, QueryTiming) =
         execute_queries(&queries, args.mode, args.clients, &make_client, |c, q| {
-            let approx =
-                run_approx_target_recall(c, db, coll, &q.vector, max_k, target, &info.name)?;
+            let approx = run_query(c, db, &query, &q.vector)?;
             Ok(ks
                 .iter()
                 .map(|&k| recall_at_k(&q.truth, &approx, k))
@@ -662,10 +691,10 @@ fn run_graph_bench(
             k,
             mode_label(args.mode, args.clients)
         );
+        let query = graph_approx_query(coll, &graph.name, graph.metric, k);
         let (per_query, latencies, timing) =
             execute_queries(&queries, args.mode, args.clients, &make_client, |c, q| {
-                let approx =
-                    run_approx_graph(c, db, coll, &q.vector, k, graph.metric, &graph.name)?;
+                let approx = run_query(c, db, &query, &q.vector)?;
                 let recall = recall_at_k(&q.truth, &approx, k);
                 let gap = sim_loss_at_k(&q.truth, &approx, k, graph.metric);
                 Ok::<(f64, Option<f64>), anyhow::Error>((recall, gap))
@@ -936,8 +965,11 @@ fn print_banner_target_recall(
     let truth_source = match &args.gt_file {
         Some(p) => format!("HDF5 file {}", p.display()),
         None => format!(
-            "first {} docs of '{}' (brute-force COSINE_SIMILARITY, {} workers)",
-            args.queries, coll, args.gt_workers
+            "first {} docs of '{}' (brute-force {}, {} workers)",
+            args.queries,
+            coll,
+            info.metric.exact_fn(),
+            args.gt_workers
         ),
     };
     println!("================================================================");
@@ -947,8 +979,10 @@ fn print_banner_target_recall(
     println!("  - Use existing collection '{}.{}'", db, coll);
     println!("    - {} vectors, dim={}", info.count, info.dimension);
     println!(
-        "    - vector index: '{}' (nLists={})",
-        info.name, info.nlists
+        "    - vector index: '{}' (metric={}, nLists={})",
+        info.name,
+        info.metric.label(),
+        info.nlists
     );
     println!("  - Ground truth: {}", truth_source);
     println!("  - Query vectors: {}", args.queries);
@@ -975,9 +1009,15 @@ fn print_target_recall_report(
     let n = per_query.len();
     println!();
     println!(
-        "Target-recall report — {} vectors, dim={}, index '{}' (nLists={}), \
+        "Target-recall report — {} vectors, dim={}, index '{}' (metric={}, nLists={}), \
          targetRecall {:.3}, {} queries",
-        info.count, info.dimension, info.name, info.nlists, target, n
+        info.count,
+        info.dimension,
+        info.name,
+        info.metric.label(),
+        info.nlists,
+        target,
+        n
     );
     println!();
     println!("   K   | mean recall | min recall | below target | fail %");
@@ -1044,8 +1084,11 @@ fn print_banner(
     let truth_source = match &args.gt_file {
         Some(p) => format!("HDF5 file {}", p.display()),
         None => format!(
-            "first {} docs of '{}' (brute-force COSINE_SIMILARITY, {} workers)",
-            args.queries, coll, args.gt_workers
+            "first {} docs of '{}' (brute-force {}, {} workers)",
+            args.queries,
+            coll,
+            info.metric.exact_fn(),
+            args.gt_workers
         ),
     };
     println!("================================================================");
@@ -1055,8 +1098,10 @@ fn print_banner(
     println!("  - Use existing collection '{}.{}'", db, coll);
     println!("    - {} vectors, dim={}", info.count, info.dimension);
     println!(
-        "    - vector index: '{}' (nLists={})",
-        info.name, info.nlists
+        "    - vector index: '{}' (metric={}, nLists={})",
+        info.name,
+        info.metric.label(),
+        info.nlists
     );
     println!("  - Ground truth: {}", truth_source);
     println!("  - Query vectors: {}", args.queries);
@@ -1378,19 +1423,24 @@ fn exact_query(coll: &str, metric: Metric, k: usize) -> String {
 }
 
 /// IVF approximate query. nProbe and LIMIT are inlined so the optimizer
-/// recognizes the APPROX_NEAR_COSINE + SORT + LIMIT pattern reliably.
-fn ivf_approx_query(coll: &str, index_name: &str, k: usize, nprobe: u64) -> String {
+/// recognizes the APPROX_NEAR_* + SORT + LIMIT pattern reliably. Metric-aware:
+/// APPROX_NEAR_COSINE…DESC for cosine, APPROX_NEAR_L2…ASC for l2.
+fn ivf_approx_query(coll: &str, index_name: &str, k: usize, nprobe: u64, metric: Metric) -> String {
     format!(
-        "FOR d IN {coll} OPTIONS {{indexHint: \"{index_name}\", forceIndexHint: true}} LET sim = APPROX_NEAR_COSINE(d.vector, @qp, {{nProbe: {nprobe}}}) SORT sim DESC LIMIT {k} RETURN {{k: d.idx, s: sim}}"
+        "FOR d IN {coll} OPTIONS {{indexHint: \"{index_name}\", forceIndexHint: true}} LET sim = {func}(d.vector, @qp, {{nProbe: {nprobe}}}) SORT sim {dir} LIMIT {k} RETURN {{k: d.idx, s: sim}}",
+        func = metric.approx_fn(),
+        dir = metric.sort_dir()
     )
 }
 
 /// IVF approximate query in targetRecall mode. targetRecall is mutually
 /// exclusive with nProbe: the server picks the probe count from the persisted
-/// autotune table that meets this recall.
-fn ivf_target_query(coll: &str, index_name: &str, k: usize, target: f64) -> String {
+/// autotune table that meets this recall. Metric-aware like `ivf_approx_query`.
+fn ivf_target_query(coll: &str, index_name: &str, k: usize, target: f64, metric: Metric) -> String {
     format!(
-        "FOR d IN {coll} OPTIONS {{indexHint: \"{index_name}\", forceIndexHint: true}} LET sim = APPROX_NEAR_COSINE(d.vector, @qp, {{targetRecall: {target}}}) SORT sim DESC LIMIT {k} RETURN {{k: d.idx, s: sim}}"
+        "FOR d IN {coll} OPTIONS {{indexHint: \"{index_name}\", forceIndexHint: true}} LET sim = {func}(d.vector, @qp, {{targetRecall: {target}}}) SORT sim {dir} LIMIT {k} RETURN {{k: d.idx, s: sim}}",
+        func = metric.approx_fn(),
+        dir = metric.sort_dir()
     )
 }
 
@@ -1417,45 +1467,12 @@ fn run_exact_topk(
     extract_id_sims(rows)
 }
 
-fn run_approx_topk(
-    client: &Client,
-    db: &str,
-    coll: &str,
-    qp: &[f32],
-    k: usize,
-    nprobe: u64,
-    index_name: &str,
-) -> Result<Vec<(i64, f64)>> {
-    let q = ivf_approx_query(coll, index_name, k, nprobe);
-    let rows = client.aql(db, &q, json!({ "qp": qp }))?;
-    extract_id_sims(rows)
-}
-
-fn run_approx_target_recall(
-    client: &Client,
-    db: &str,
-    coll: &str,
-    qp: &[f32],
-    k: usize,
-    target_recall: f64,
-    index_name: &str,
-) -> Result<Vec<(i64, f64)>> {
-    let q = ivf_target_query(coll, index_name, k, target_recall);
-    let rows = client.aql(db, &q, json!({ "qp": qp }))?;
-    extract_id_sims(rows)
-}
-
-fn run_approx_graph(
-    client: &Client,
-    db: &str,
-    coll: &str,
-    qp: &[f32],
-    k: usize,
-    metric: Metric,
-    index_name: &str,
-) -> Result<Vec<(i64, f64)>> {
-    let q = graph_approx_query(coll, index_name, metric, k);
-    let rows = client.aql(db, &q, json!({ "qp": qp }))?;
+/// Run a pre-built approx AQL query with the query point bound as `@qp` and
+/// return the (idx, score) rows. The query string is constant across the query
+/// vectors in a measurement pass (only `@qp` changes), so callers build it once
+/// per pass with the metric-aware query builders.
+fn run_query(client: &Client, db: &str, query: &str, qp: &[f32]) -> Result<Vec<(i64, f64)>> {
+    let rows = client.aql(db, query, json!({ "qp": qp }))?;
     extract_id_sims(rows)
 }
 
@@ -1534,10 +1551,11 @@ fn print_report(
 ) {
     println!();
     println!(
-        "Cosine recall report — {} vectors, dim={}, index '{}' (nLists={}), {}",
+        "IVF recall report — {} vectors, dim={}, index '{}' (metric={}, nLists={}), {}",
         info.count,
         info.dimension,
         info.name,
+        info.metric.label(),
         info.nlists,
         mode_label(mode, clients)
     );
@@ -1582,12 +1600,23 @@ fn print_report(
         .iter()
         .any(|r| r.sim_loss.iter().any(|v| v.is_some()));
     if any_sim_loss {
+        let (gap_label, gap_desc) = if info.metric.is_similarity() {
+            (
+                "loss",
+                "Mean similarity loss per result (truth mean sim - approx mean sim).",
+            )
+        } else {
+            (
+                "gap",
+                "Mean distance gap per result (approx mean dist - truth mean dist).",
+            )
+        };
         println!();
-        println!("Mean similarity loss per result (truth mean sim - approx mean sim).");
+        println!("{}", gap_desc);
         println!("Near 0 means the approx misses are near-ties with the truth top-K.");
         print!("nProbe |");
         for k in ks {
-            print!("  loss@{:>3} |", k);
+            print!("  {}@{:>3} |", gap_label, k);
         }
         println!();
         println!("{}", "-".repeat(8 + ks.len() * 13));
@@ -1702,6 +1731,24 @@ mod tests {
         assert!(q.contains("APPROX_NEAR_L2"));
         assert!(q.contains("SORT s ASC"));
         assert!(!q.contains("nProbe"));
+    }
+
+    #[test]
+    fn ivf_queries_are_metric_aware() {
+        let cos = ivf_approx_query("coll", "vec", 10, 8, Metric::Cosine);
+        assert!(cos.contains("APPROX_NEAR_COSINE"));
+        assert!(cos.contains("SORT sim DESC"));
+        assert!(cos.contains("nProbe: 8"));
+
+        let l2 = ivf_approx_query("coll", "vec", 10, 8, Metric::L2);
+        assert!(l2.contains("APPROX_NEAR_L2"));
+        assert!(l2.contains("SORT sim ASC"));
+        assert!(l2.contains("nProbe: 8"));
+
+        let l2_target = ivf_target_query("coll", "vec", 10, 0.95, Metric::L2);
+        assert!(l2_target.contains("APPROX_NEAR_L2"));
+        assert!(l2_target.contains("SORT sim ASC"));
+        assert!(l2_target.contains("targetRecall: 0.95"));
     }
 
     #[test]
