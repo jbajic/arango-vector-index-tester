@@ -19,6 +19,21 @@ struct Query {
     truth: Vec<(i64, Option<f64>)>,
 }
 
+/// Static facts about the collection and vector index under test, resolved once
+/// in `run` and threaded through the banners, reports, and measurement drivers.
+struct IndexInfo {
+    /// Number of documents in the collection.
+    count: u64,
+    /// Vector dimension.
+    dimension: u64,
+    /// Resolved IVF nLists of the index.
+    nlists: u64,
+    /// Index name.
+    name: String,
+    /// Full index handle ("collection/id"), used for the autotune endpoints.
+    id: String,
+}
+
 struct NProbeResult {
     nprobe: u64,
     recall: Vec<f64>,
@@ -288,6 +303,13 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result
         .as_u64()
         .context("could not determine dimension from index definition")?;
     let count = client.collection_count(db, coll)?;
+    let info = IndexInfo {
+        count,
+        dimension,
+        nlists,
+        name: index_name,
+        id: index_id,
+    };
 
     let mut ks: Vec<usize> = args.topk.clone();
     ks.sort_unstable();
@@ -298,57 +320,34 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result
         if target <= 0.0 || target > 1.0 {
             bail!("--target-recall must be a number in (0, 1], got {}", target);
         }
-        return run_target_recall(
-            client,
-            db,
-            coll,
-            &args,
-            &index_name,
-            &index_id,
-            count,
-            dimension,
-            nlists,
-            &ks,
-            max_k,
-            target,
-        );
+        return run_target_recall(client, db, coll, &args, &info, &ks, target);
     }
 
     let mut nprobes: Vec<u64> = args
         .nprobes
         .iter()
         .copied()
-        .filter(|p| *p <= nlists)
+        .filter(|p| *p <= info.nlists)
         .collect();
     nprobes.sort_unstable();
     nprobes.dedup();
     if nprobes.is_empty() {
         bail!(
             "no nProbe values remain after clamping to nLists={}",
-            nlists
+            info.nlists
         );
     }
 
-    print_banner(
-        &args,
-        db,
-        coll,
-        count,
-        dimension,
-        nlists,
-        &index_name,
-        &ks,
-        &nprobes,
-    );
+    print_banner(&args, db, coll, &info, &ks, &nprobes);
     let sample_nprobe = *nprobes.first().unwrap();
     print_sample_query_and_plan(
         client,
         db,
         coll,
-        dimension as usize,
+        info.dimension as usize,
         max_k,
         &format!("nProbe: {}", sample_nprobe),
-        &index_name,
+        &info.name,
     )?;
 
     let queries: Vec<Query> = if let Some(path) = args.gt_file.as_deref() {
@@ -367,7 +366,7 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result
         );
         let (per_query, latencies, timing): (Vec<PerQueryStats>, Vec<f64>, QueryTiming) =
             execute_queries(&queries, args.mode, args.clients, &make_client, |c, q| {
-                let approx = run_approx_topk(c, db, coll, &q.vector, max_k, nprobe, &index_name)?;
+                let approx = run_approx_topk(c, db, coll, &q.vector, max_k, nprobe, &info.name)?;
                 let recall: Vec<f64> = ks
                     .iter()
                     .map(|&k| recall_at_k(&q.truth, &approx, k))
@@ -403,16 +402,7 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result
         });
     }
 
-    print_report(
-        count,
-        dimension,
-        nlists,
-        &index_name,
-        &ks,
-        &results,
-        args.mode,
-        args.clients,
-    );
+    print_report(&info, &ks, &results, args.mode, args.clients);
     Ok(())
 }
 
@@ -425,32 +415,25 @@ fn mode_label(mode: BenchMode, clients: usize) -> String {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_target_recall(
     client: &Client,
     db: &str,
     coll: &str,
     args: &BenchArgs,
-    index_name: &str,
-    index_id: &str,
-    count: u64,
-    dimension: u64,
-    nlists: u64,
+    info: &IndexInfo,
     ks: &[usize],
-    max_k: usize,
     target: f64,
 ) -> Result<()> {
-    print_banner_target_recall(
-        args, db, coll, count, dimension, nlists, index_name, ks, target,
-    );
+    let max_k = *ks.last().expect("ks is non-empty (validated in run)");
+    print_banner_target_recall(args, db, coll, info, ks, target);
     print_sample_query_and_plan(
         client,
         db,
         coll,
-        dimension as usize,
+        info.dimension as usize,
         max_k,
         &format!("targetRecall: {}", target),
-        index_name,
+        &info.name,
     )?;
 
     // The targetRecall query option resolves the probe count from the index's
@@ -460,7 +443,7 @@ fn run_target_recall(
     ensure_autotuned(
         client,
         db,
-        index_id,
+        &info.id,
         max_k,
         target,
         args.autotune_timeout_sec,
@@ -483,7 +466,7 @@ fn run_target_recall(
     let (per_query, latencies, timing): (Vec<Vec<f64>>, Vec<f64>, QueryTiming) =
         execute_queries(&queries, args.mode, args.clients, &make_client, |c, q| {
             let approx =
-                run_approx_target_recall(c, db, coll, &q.vector, max_k, target, index_name)?;
+                run_approx_target_recall(c, db, coll, &q.vector, max_k, target, &info.name)?;
             Ok(ks
                 .iter()
                 .map(|&k| recall_at_k(&q.truth, &approx, k))
@@ -495,17 +478,7 @@ fn run_target_recall(
     }
     let latency_buckets = latency_bucket_recall(&latencies, &per_query, ks.len());
 
-    print_target_recall_report(
-        count,
-        dimension,
-        nlists,
-        index_name,
-        ks,
-        target,
-        &per_query,
-        &timing,
-        &latency_buckets,
-    );
+    print_target_recall_report(info, ks, target, &per_query, &timing, &latency_buckets);
     Ok(())
 }
 
@@ -515,7 +488,6 @@ fn run_target_recall(
 /// request. Autotune can run far longer than a single HTTP request, so it is
 /// submitted via the async job API and the job is polled until it finishes or
 /// `timeout_sec` elapses.
-#[allow(clippy::too_many_arguments)]
 fn ensure_autotuned(
     client: &Client,
     db: &str,
@@ -648,15 +620,11 @@ fn print_operating_points(v: &Value, top_k: usize) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn print_banner_target_recall(
     args: &BenchArgs,
     db: &str,
     coll: &str,
-    count: u64,
-    dim: u64,
-    nlists: u64,
-    index_name: &str,
+    info: &IndexInfo,
     ks: &[usize],
     target: f64,
 ) {
@@ -672,8 +640,11 @@ fn print_banner_target_recall(
     println!("================================================================");
     println!("What we're going to do:");
     println!("  - Use existing collection '{}.{}'", db, coll);
-    println!("    - {} vectors, dim={}", count, dim);
-    println!("    - vector index: '{}' (nLists={})", index_name, nlists);
+    println!("    - {} vectors, dim={}", info.count, info.dimension);
+    println!(
+        "    - vector index: '{}' (nLists={})",
+        info.name, info.nlists
+    );
     println!("  - Ground truth: {}", truth_source);
     println!("  - Query vectors: {}", args.queries);
     println!("  - Recall cutoffs K: {:?}", ks);
@@ -687,12 +658,8 @@ fn print_banner_target_recall(
     println!();
 }
 
-#[allow(clippy::too_many_arguments)]
 fn print_target_recall_report(
-    count: u64,
-    dim: u64,
-    nlists: u64,
-    index_name: &str,
+    info: &IndexInfo,
     ks: &[usize],
     target: f64,
     per_query: &[Vec<f64>],
@@ -703,8 +670,11 @@ fn print_target_recall_report(
     println!();
     println!("================================================================");
     println!("Target-recall report");
-    println!("  dataset:      {} vectors, dim={}", count, dim);
-    println!("  index:        '{}' (nLists={})", index_name, nlists);
+    println!(
+        "  dataset:      {} vectors, dim={}",
+        info.count, info.dimension
+    );
+    println!("  index:        '{}' (nLists={})", info.name, info.nlists);
     println!("  targetRecall: {:.3}", target);
     println!("  queries:      {}", n);
     println!("================================================================");
@@ -764,15 +734,11 @@ fn print_latency_bucket_recall(ks: &[usize], buckets: &[LatencyBucket]) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn print_banner(
     args: &BenchArgs,
     db: &str,
     coll: &str,
-    count: u64,
-    dim: u64,
-    nlists: u64,
-    index_name: &str,
+    info: &IndexInfo,
     ks: &[usize],
     nprobes: &[u64],
 ) {
@@ -788,8 +754,11 @@ fn print_banner(
     println!("================================================================");
     println!("What we're going to do:");
     println!("  - Use existing collection '{}.{}'", db, coll);
-    println!("    - {} vectors, dim={}", count, dim);
-    println!("    - vector index: '{}' (nLists={})", index_name, nlists);
+    println!("    - {} vectors, dim={}", info.count, info.dimension);
+    println!(
+        "    - vector index: '{}' (nLists={})",
+        info.name, info.nlists
+    );
     println!("  - Ground truth: {}", truth_source);
     println!("  - Query vectors: {}", args.queries);
     println!("  - Recall cutoffs K: {:?}", ks);
@@ -1187,12 +1156,8 @@ fn sim_loss_at_k(truth: &[(i64, Option<f64>)], approx: &[(i64, f64)], k: usize) 
     Some(truth_sum / count as f64 - approx_sum / take as f64)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn print_report(
-    count: u64,
-    dim: u64,
-    nlists: u64,
-    index_name: &str,
+    info: &IndexInfo,
     ks: &[usize],
     results: &[NProbeResult],
     mode: BenchMode,
@@ -1201,8 +1166,11 @@ fn print_report(
     println!();
     println!("================================================================");
     println!("Cosine recall report");
-    println!("  dataset:    {} vectors, dim={}", count, dim);
-    println!("  index:      '{}' (nLists={})", index_name, nlists);
+    println!(
+        "  dataset:    {} vectors, dim={}",
+        info.count, info.dimension
+    );
+    println!("  index:      '{}' (nLists={})", info.name, info.nlists);
     println!("  measured:   {}", mode_label(mode, clients));
     println!("================================================================");
     println!("Recall vs latency tradeoff: each nProbe is one operating point (higher");
@@ -1275,4 +1243,129 @@ fn print_report(
         }
     }
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approx_eq(a: f64, b: f64) {
+        assert!((a - b).abs() < 1e-9, "expected {b}, got {a}");
+    }
+
+    #[test]
+    fn percentile_uses_nearest_rank() {
+        let sorted = [10.0, 20.0, 30.0, 40.0, 50.0];
+        approx_eq(percentile(&sorted, 50.0), 30.0);
+        approx_eq(percentile(&sorted, 100.0), 50.0);
+        approx_eq(percentile(&sorted, 90.0), 50.0);
+        approx_eq(percentile(&sorted, 20.0), 10.0);
+        // p=0 clamps to the first sample rather than underflowing.
+        approx_eq(percentile(&sorted, 0.0), 10.0);
+    }
+
+    #[test]
+    fn percentile_single_element() {
+        approx_eq(percentile(&[42.0], 50.0), 42.0);
+        approx_eq(percentile(&[42.0], 0.0), 42.0);
+        approx_eq(percentile(&[42.0], 100.0), 42.0);
+    }
+
+    fn ids(ids: &[i64]) -> Vec<(i64, Option<f64>)> {
+        ids.iter().map(|&id| (id, None)).collect()
+    }
+
+    fn approx(ids: &[i64]) -> Vec<(i64, f64)> {
+        ids.iter().map(|&id| (id, 0.0)).collect()
+    }
+
+    #[test]
+    fn recall_at_k_counts_hits_over_capped_denominator() {
+        let truth = ids(&[1, 2, 3, 4, 5]);
+        approx_eq(recall_at_k(&truth, &approx(&[1, 2, 3, 9, 10]), 5), 0.6);
+        approx_eq(recall_at_k(&truth, &approx(&[1, 2, 3, 4, 5]), 5), 1.0);
+        approx_eq(recall_at_k(&truth, &approx(&[1, 9, 9, 9, 9]), 1), 1.0);
+        approx_eq(recall_at_k(&truth, &approx(&[9, 9, 9, 9, 9]), 5), 0.0);
+    }
+
+    #[test]
+    fn recall_at_k_denominator_capped_by_available_truth() {
+        // Only 3 true neighbors but k=5: denominator is 3, not 5.
+        let truth = ids(&[1, 2, 3]);
+        approx_eq(recall_at_k(&truth, &approx(&[1, 2, 3, 9, 10]), 5), 1.0);
+    }
+
+    #[test]
+    fn sim_loss_is_mean_truth_minus_mean_approx() {
+        let truth = vec![(1, Some(1.0)), (2, Some(0.9))];
+        let approx = vec![(1, 0.95), (2, 0.85)];
+        // (1.0 + 0.9)/2 - (0.95 + 0.85)/2 = 0.95 - 0.90 = 0.05
+        approx_eq(sim_loss_at_k(&truth, &approx, 2).unwrap(), 0.05);
+    }
+
+    #[test]
+    fn sim_loss_none_when_truth_similarity_missing() {
+        let truth = vec![(1, Some(1.0)), (2, None)];
+        let approx = vec![(1, 0.95), (2, 0.85)];
+        assert!(sim_loss_at_k(&truth, &approx, 2).is_none());
+    }
+
+    #[test]
+    fn sim_loss_none_for_empty_slice() {
+        assert!(sim_loss_at_k(&[], &[], 5).is_none());
+        let truth = vec![(1, Some(1.0))];
+        assert!(sim_loss_at_k(&truth, &[], 5).is_none());
+    }
+
+    #[test]
+    fn angular_dist_to_cos_sim_is_one_minus_distance() {
+        // f32 arithmetic, so compare with an f32-scale tolerance.
+        assert!((angular_dist_to_cos_sim(0.2) - 0.8).abs() < 1e-6);
+        assert!((angular_dist_to_cos_sim(0.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn latency_bucket_recall_partitions_into_bands() {
+        let latencies: Vec<f64> = (1..=10).map(|i| i as f64).collect();
+        // recall[i] = i, so band means are easy to check.
+        let per_query: Vec<Vec<f64>> = (0..10).map(|i| vec![i as f64]).collect();
+        let buckets = latency_bucket_recall(&latencies, &per_query, 1);
+
+        // p99/p100 bands are empty for n=10 and are omitted.
+        let labels: Vec<&str> = buckets.iter().map(|b| b.label).collect();
+        assert_eq!(labels, vec!["p50", "p90", "p95"]);
+
+        let p50 = &buckets[0];
+        assert_eq!(p50.count, 5);
+        approx_eq(p50.recall[0], 2.0); // mean of 0..=4
+        approx_eq(p50.edge_ms, 5.0);
+
+        let p90 = &buckets[1];
+        assert_eq!(p90.count, 4);
+        approx_eq(p90.recall[0], 6.5); // mean of 5..=8
+        approx_eq(p90.edge_ms, 9.0);
+
+        let p95 = &buckets[2];
+        assert_eq!(p95.count, 1);
+        approx_eq(p95.recall[0], 9.0);
+        approx_eq(p95.edge_ms, 10.0);
+    }
+
+    #[test]
+    fn latency_bucket_recall_empty_input() {
+        assert!(latency_bucket_recall(&[], &[], 1).is_empty());
+    }
+
+    #[test]
+    fn autotune_table_covers_checks_topk_and_recall() {
+        let v = json!({
+            "tunedTables": [
+                { "topK": 10, "points": [ { "recall": 0.90 }, { "recall": 0.96 } ] }
+            ]
+        });
+        assert!(autotune_table_covers(&v, 10, 0.95));
+        assert!(!autotune_table_covers(&v, 10, 0.99));
+        // No table for topK=5.
+        assert!(!autotune_table_covers(&v, 5, 0.50));
+    }
 }

@@ -668,3 +668,62 @@ fn is_ready(idx: &Value) -> bool {
     }
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_ranges_splits_evenly_and_handles_remainder() {
+        assert_eq!(batch_ranges(10, 3), vec![(0, 3), (3, 6), (6, 9), (9, 10)]);
+        assert_eq!(batch_ranges(10, 5), vec![(0, 5), (5, 10)]);
+    }
+
+    #[test]
+    fn batch_ranges_handles_edge_sizes() {
+        assert_eq!(batch_ranges(0, 5), Vec::<(usize, usize)>::new());
+        assert_eq!(batch_ranges(5, 10), vec![(0, 5)]);
+        assert_eq!(batch_ranges(3, 1), vec![(0, 1), (1, 2), (2, 3)]);
+    }
+
+    #[test]
+    fn infer_metric_reads_dataset_name_suffix() {
+        assert_eq!(infer_metric("sift-128-euclidean"), "l2");
+        assert_eq!(infer_metric("lastfm-64-dot"), "dot");
+        assert_eq!(infer_metric("glove-100-angular"), "cosine");
+        // Unknown suffix falls back to cosine.
+        assert_eq!(infer_metric("mystery-dataset"), "cosine");
+    }
+
+    #[test]
+    fn normalize_metric_accepts_synonyms_case_insensitively() {
+        assert_eq!(normalize_metric("cosine").unwrap(), "cosine");
+        assert_eq!(normalize_metric("angular").unwrap(), "cosine");
+        assert_eq!(normalize_metric("l2").unwrap(), "l2");
+        assert_eq!(normalize_metric("euclidean").unwrap(), "l2");
+        assert_eq!(normalize_metric("dot").unwrap(), "dot");
+        assert_eq!(normalize_metric("ip").unwrap(), "dot");
+        assert_eq!(normalize_metric("inner_product").unwrap(), "dot");
+        assert_eq!(normalize_metric("inner-product").unwrap(), "dot");
+        // Trimmed and lowercased before matching.
+        assert_eq!(normalize_metric("  Cosine  ").unwrap(), "cosine");
+    }
+
+    #[test]
+    fn normalize_metric_rejects_unknown() {
+        assert!(normalize_metric("hamming").is_err());
+    }
+
+    #[test]
+    fn looks_like_path_distinguishes_files_from_dataset_slugs() {
+        assert!(!looks_like_path("glove-100-angular"));
+        assert!(looks_like_path("data.h5"));
+        assert!(looks_like_path("data.hdf5"));
+        assert!(looks_like_path(&format!(
+            "sub{}file.h5",
+            std::path::MAIN_SEPARATOR
+        )));
+        // A relative name with a non-HDF5 extension and no separator is a slug.
+        assert!(!looks_like_path("some-dataset.txt"));
+    }
+}
