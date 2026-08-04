@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::client::Client;
-use crate::SetupArgs;
+use crate::{IndexType, SetupArgs};
 
 const DEFAULT_RANDOM_NDOCS: usize = 200_000;
 
@@ -118,11 +118,13 @@ fn open_vector_dataset(path: &Path) -> Result<VectorDataset> {
     )
 }
 
-fn index_name(metric: &str) -> &'static str {
-    match metric {
-        "l2" => "vector_l2",
-        "dot" => "vector_dot",
-        _ => "vector_cosine",
+fn default_index_name(index_type: IndexType, metric: &str) -> &'static str {
+    match (index_type, metric) {
+        (IndexType::VectorGraph, "l2") => "vector_graph_l2",
+        (IndexType::VectorGraph, _) => "vector_graph_cosine",
+        (IndexType::Ivf, "l2") => "vector_l2",
+        (IndexType::Ivf, "dot") => "vector_dot",
+        (IndexType::Ivf, _) => "vector_cosine",
     }
 }
 
@@ -147,18 +149,22 @@ struct Inserted {
 }
 
 pub fn run(client: &Client, db: &str, coll: &str, mut args: SetupArgs) -> Result<()> {
-    // A concrete factory string requires nLists to equal its nlist, so fail
-    // fast rather than letting index creation error out later. A templated
-    // factory (with a `{}` placeholder) lets the server fill in the resolved
-    // nLists, so nLists is optional there.
-    if let Some(ref factory) = args.factory {
-        if !factory.contains("{}") && args.nlists.is_none() {
-            bail!(
-                "a non-templated --factory requires --nlists set to the factory \
-                 string's nlist; use the `{{}}` placeholder (e.g. \
-                 \"IVF{{}}_HNSW32,PQ32x8\") to let the server auto-select nLists"
-            );
+    // Factory/nLists are IVF-only. A concrete factory string requires nLists to
+    // equal its nlist, so fail fast rather than letting index creation error out
+    // later. A templated factory (with a `{}` placeholder) lets the server fill
+    // in the resolved nLists, so nLists is optional there.
+    if args.index_type == IndexType::Ivf {
+        if let Some(ref factory) = args.factory {
+            if !factory.contains("{}") && args.nlists.is_none() {
+                bail!(
+                    "a non-templated --factory requires --nlists set to the factory \
+                     string's nlist; use the `{{}}` placeholder (e.g. \
+                     \"IVF{{}}_HNSW32,PQ32x8\") to let the server auto-select nLists"
+                );
+            }
         }
+    } else if args.factory.is_some() || args.nlists.is_some() {
+        bail!("--factory and --nlists are IVF-only; the vector-graph index has no nLists/training");
     }
 
     if let Some(ref name) = args.ann_dataset.clone() {
@@ -166,10 +172,13 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: SetupArgs) -> Result
     }
 
     let metric = resolve_metric(&args)?;
+    if args.index_type == IndexType::VectorGraph && metric == "dot" {
+        bail!("the vector-graph index supports only cosine or l2 metrics, not dot");
+    }
     let idx_name = args
         .index_name
         .clone()
-        .unwrap_or_else(|| index_name(metric).to_string());
+        .unwrap_or_else(|| default_index_name(args.index_type, metric).to_string());
 
     // Random mode: resolve the RNG seed, generating a fresh one when omitted.
     if args.input.is_none() {
@@ -183,7 +192,7 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: SetupArgs) -> Result
             Some(path) => open_vector_dataset(path)?.dim,
             None => args.dim,
         };
-        create_vector_index(client, db, coll, &args, dim, metric, &idx_name)?;
+        create_index(client, db, coll, &args, dim, metric, &idx_name)?;
         print_index_stats(client, db, coll, &idx_name)?;
         return Ok(());
     }
@@ -207,8 +216,24 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: SetupArgs) -> Result
     client.drop_collection_if_exists(db, coll)?;
     client.create_collection(db, coll, args.shards)?;
 
-    let inserted = insert_dataset(client, db, coll, &args)?;
-    create_vector_index(client, db, coll, &args, inserted.dim, metric, &idx_name)?;
+    // The vector-graph index is built on the empty collection and populated
+    // afterwards (it indexes each document as it is inserted); the IVF index is
+    // trained on the already-ingested data, so it is created last.
+    let inserted = match args.index_type {
+        IndexType::VectorGraph => {
+            let dim = match args.input.as_deref() {
+                Some(path) => open_vector_dataset(path)?.dim,
+                None => args.dim,
+            };
+            create_index(client, db, coll, &args, dim, metric, &idx_name)?;
+            insert_dataset(client, db, coll, &args)?
+        }
+        IndexType::Ivf => {
+            let inserted = insert_dataset(client, db, coll, &args)?;
+            create_index(client, db, coll, &args, inserted.dim, metric, &idx_name)?;
+            inserted
+        }
+    };
     print_index_stats(client, db, coll, &idx_name)?;
 
     println!();
@@ -312,10 +337,6 @@ fn download_dataset(url: &str, dest: &Path) -> Result<()> {
 }
 
 fn print_banner(args: &SetupArgs, db: &str, coll: &str, metric: &str, idx_name: &str) {
-    let nlists_str = args
-        .nlists
-        .map(|n| n.to_string())
-        .unwrap_or_else(|| "auto".to_string());
     let source = match &args.input {
         Some(p) => format!("HDF5 file {}", p.display()),
         None => format!(
@@ -330,6 +351,14 @@ fn print_banner(args: &SetupArgs, db: &str, coll: &str, metric: &str, idx_name: 
         (None, Some(n)) => format!("{} docs", n),
         (None, None) => format!("{} docs", DEFAULT_RANDOM_NDOCS),
     };
+    let insert_step = |n: u32| {
+        println!("  {}. Insert {} from {}", n, count_str, source);
+        println!(
+            "     - {} parallel workers, batch={}",
+            args.workers, args.batch
+        );
+        println!("     - each doc: {{ idx: <row>, vector: [...] }}");
+    };
     println!("================================================================");
     println!("vrecall setup");
     println!("================================================================");
@@ -339,19 +368,44 @@ fn print_banner(args: &SetupArgs, db: &str, coll: &str, metric: &str, idx_name: 
         "  2. Drop (if exists) and recreate collection '{}' (shards={})",
         coll, args.shards
     );
-    println!("  3. Insert {} from {}", count_str, source);
-    println!(
-        "     - {} parallel workers, batch={}",
-        args.workers, args.batch
-    );
-    println!("     - each doc: {{ idx: <row>, vector: [...] }}");
-    println!("  4. Build vector index '{}':", idx_name);
-    println!("     - type=vector, metric={}", metric);
-    println!("     - nLists={}, trainingIterations={}", nlists_str, 25);
-    println!(
-        "     - waits up to {}s for ready state",
-        args.index_timeout_sec
-    );
+    match args.index_type {
+        IndexType::Ivf => {
+            let nlists_str = args
+                .nlists
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "auto".to_string());
+            insert_step(3);
+            println!("  4. Build IVF vector index '{}':", idx_name);
+            println!("     - type=vector, metric={}", metric);
+            println!("     - nLists={}, trainingIterations={}", nlists_str, 25);
+            println!(
+                "     - waits up to {}s for ready state",
+                args.index_timeout_sec
+            );
+        }
+        IndexType::VectorGraph => {
+            // The graph index is created first, then populated as docs stream in.
+            let degree_str = args
+                .max_degree
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| "default".to_string());
+            let alpha_str = args
+                .alpha
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "default".to_string());
+            println!(
+                "  3. Build vector-graph index '{}' (on empty collection):",
+                idx_name
+            );
+            println!("     - type=vector-graph, metric={}", metric);
+            println!(
+                "     - maxDegree={}, alpha={} (no training)",
+                degree_str, alpha_str
+            );
+            insert_step(4);
+            println!("     - the index is populated as documents are inserted");
+        }
+    }
     println!();
 }
 
@@ -516,6 +570,71 @@ fn make_batch_from_rows(data: &Array2<f32>, row_offset: usize, start: usize, end
     Value::Array(docs)
 }
 
+fn create_index(
+    client: &Client,
+    db: &str,
+    coll: &str,
+    args: &SetupArgs,
+    dim: usize,
+    metric: &str,
+    idx_name: &str,
+) -> Result<()> {
+    match args.index_type {
+        IndexType::Ivf => create_vector_index(client, db, coll, args, dim, metric, idx_name),
+        IndexType::VectorGraph => {
+            create_vector_graph_index(client, db, coll, args, dim, metric, idx_name)
+        }
+    }
+}
+
+// The vector-graph index carries no nLists/training; it becomes usable as soon
+// as ensureIndex returns, so there is no ready-state to wait for. The server
+// enforces dimension % 32 == 0 and metric in {cosine, l2}; we surface its error
+// verbatim rather than pre-validating here.
+fn create_vector_graph_index(
+    client: &Client,
+    db: &str,
+    coll: &str,
+    args: &SetupArgs,
+    dim: usize,
+    metric: &str,
+    idx_name: &str,
+) -> Result<()> {
+    let degree_label = args
+        .max_degree
+        .map(|d| d.to_string())
+        .unwrap_or_else(|| "default".to_string());
+    let alpha_label = args
+        .alpha
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| "default".to_string());
+    println!(
+        "Creating vector-graph index '{}' (metric={}, dim={}, maxDegree={}, alpha={})...",
+        idx_name, metric, dim, degree_label, alpha_label
+    );
+    let start = Instant::now();
+    let mut params = json!({
+        "metric": metric,
+        "dimension": dim,
+    });
+    if let Some(d) = args.max_degree {
+        params["maxDegree"] = json!(d);
+    }
+    if let Some(a) = args.alpha {
+        params["alpha"] = json!(a);
+    }
+    let def = json!({
+        "name": idx_name,
+        "type": "vector-graph",
+        "fields": ["vector"],
+        "inBackground": false,
+        "params": params,
+    });
+    client.create_vector_index(db, coll, &def)?;
+    println!("Index created in {:.1}s.", start.elapsed().as_secs_f64());
+    Ok(())
+}
+
 fn create_vector_index(
     client: &Client,
     db: &str,
@@ -575,6 +694,10 @@ fn print_index_stats(client: &Client, db: &str, coll: &str, idx_name: &str) -> R
         .iter()
         .find(|i| i["name"].as_str() == Some(idx_name))
         .with_context(|| format!("vector index '{}' not found after creation", idx_name))?;
+    if idx["type"].as_str() == Some("vector-graph") {
+        print_graph_index_stats(idx);
+        return Ok(());
+    }
     let params = &idx["params"];
     let user_nlists = params["nLists"].as_u64();
     let resolved = idx["resolvedNLists"]
@@ -634,6 +757,42 @@ fn print_index_stats(client: &Client, db: &str, coll: &str, idx_name: &str) -> R
         );
     }
     Ok(())
+}
+
+// The vector-graph index reports maxDegree/alpha instead of nLists/training;
+// segment figures are only present when the server includes them in the listing.
+fn print_graph_index_stats(idx: &Value) {
+    let params = &idx["params"];
+    println!("Vector-graph index stats:");
+    println!(
+        "  name:               {}",
+        idx["name"].as_str().unwrap_or("?")
+    );
+    println!(
+        "  metric:             {}",
+        params["metric"].as_str().unwrap_or("?")
+    );
+    println!(
+        "  dimension:          {}",
+        params["dimension"].as_u64().unwrap_or(0)
+    );
+    println!(
+        "  maxDegree (R):      {}",
+        params["maxDegree"].as_u64().unwrap_or(0)
+    );
+    println!(
+        "  alpha:              {:.2}",
+        params["alpha"].as_f64().unwrap_or(0.0)
+    );
+    for (label, key) in [
+        ("segmentCount", "segmentCount"),
+        ("encodedVectorCount", "encodedVectorCount"),
+        ("onDiskBytes", "onDiskBytes"),
+    ] {
+        if let Some(n) = idx[key].as_u64() {
+            println!("  {:<18}: {}", label, n);
+        }
+    }
 }
 
 fn wait_for_index_ready(

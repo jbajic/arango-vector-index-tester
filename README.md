@@ -69,19 +69,50 @@ Key flags:
 
 | Flag                 | Default      | Description                                                        |
 |----------------------|--------------|-------------------------------------------------------------------|
+| `--index-type`       | `ivf`        | Vector index kind: `ivf` (FAISS IVF) or `vector-graph` (Vamana/DiskANN graph). See [Vector-graph index](#vector-graph-index) |
 | `--ann-dataset`      | —            | Dataset to load: a named ann-benchmarks dataset to auto-download, or a path to a local HDF5 file (reads `train`, else `vectors`; streamed in blocks) |
-| `--metric`           | auto/cosine  | Index metric (`cosine`/`l2`/`dot`). Auto-detected from a custom file's `metric` attribute or a named `--ann-dataset`; this flag overrides both |
+| `--metric`           | auto/cosine  | Index metric (`cosine`/`l2`/`dot`). Auto-detected from a custom file's `metric` attribute or a named `--ann-dataset`; this flag overrides both. The vector-graph index supports only `cosine`/`l2` |
 | `--only-vector`      | off          | Skip ingestion; only (re)create the index on existing data        |
 | `--dim`              | `768`        | Vector dimension (random mode only)                               |
 | `--ndocs`            | random: `200000` | Number of documents. HDF5 mode: all rows when omitted, else truncates |
-| `--nlists`           | auto         | IVF nLists (ArangoDB auto-selects when omitted)                   |
-| `--factory`          | —            | FAISS `index_factory` string (e.g. `IVF4096_HNSW32,PQ32x8`). Concrete nlist requires a matching `--nlists`; a `{}` placeholder (e.g. `IVF{}_HNSW32,PQ32x8`) lets the server fill in the resolved nLists, making `--nlists` optional |
-| `--index-name`       | metric-derived | Name for the created index (`vector_cosine`/`_l2`/`_dot` by default) |
+| `--nlists`           | auto         | IVF nLists (ArangoDB auto-selects when omitted). IVF-only          |
+| `--factory`          | —            | FAISS `index_factory` string (e.g. `IVF4096_HNSW32,PQ32x8`). Concrete nlist requires a matching `--nlists`; a `{}` placeholder (e.g. `IVF{}_HNSW32,PQ32x8`) lets the server fill in the resolved nLists, making `--nlists` optional. IVF-only |
+| `--max-degree`       | server (64)  | Vamana out-degree bound R, in [1, 64]. vector-graph only           |
+| `--alpha`            | server (1.2) | Vamana pruning slack, in [1.0, 2.0]. vector-graph only             |
+| `--index-name`       | metric-derived | Name for the created index (IVF: `vector_cosine`/`_l2`/`_dot`; graph: `vector_graph_cosine`/`_l2`) |
 | `--shards`           | `3`          | Collection shard count                                            |
 | `--seed`             | random       | Base RNG seed (random mode only); a fresh seed is printed if omitted |
 | `--batch`            | `5000`       | Documents per HTTP insert batch                                   |
 | `--workers`          | `16`         | Parallel insert workers                                           |
-| `--index-timeout-sec`| `1800`       | Max seconds to wait for index ready state                         |
+| `--index-timeout-sec`| `1800`       | Max seconds to wait for index ready state (IVF only; the graph index is ready immediately) |
+
+#### Vector-graph index
+
+`--index-type vector-graph` builds a Vamana/DiskANN-style graph index instead of
+the FAISS IVF index. It differs in three ways that matter here:
+
+- **Created before ingestion.** The graph index needs no training, so `setup`
+  creates it on the *empty* collection and it is populated as documents stream
+  in (the IVF index is trained on the already-loaded data and so is created
+  last). `setup` handles the ordering automatically.
+- **Constraints.** The dimension must be a multiple of 32, and the metric must
+  be `cosine` or `l2` (`dot`/innerProduct is unsupported). Its only tunables are
+  `--max-degree` (R) and `--alpha`.
+- **Single operating point.** There is no nProbe and no autotune/`targetRecall`.
+  The internal search-list size is fixed, so `bench` cannot sweep quality the
+  way it does for IVF (see the `bench` section below).
+
+```bash
+# Random cosine graph index (dim 768 is a multiple of 32)
+vrecall setup --index-type vector-graph --ndocs 200000 --dim 768
+
+# From an ann-benchmarks dataset whose dim is a multiple of 32 (e.g. sift-128,
+# gist-960); l2 metric is auto-detected from the "-euclidean" name
+vrecall setup --index-type vector-graph --ann-dataset sift-128-euclidean
+
+# Custom Vamana build parameters
+vrecall setup --index-type vector-graph --dim 768 --max-degree 48 --alpha 1.4
+```
 
 #### Custom HDF5 file layout
 
@@ -133,6 +164,19 @@ vrecall bench --ann-dataset ~/Downloads/ML-dataset/hotpotqa_groundtruth.h5 \
 
 # targetRecall (autotune) mode instead of the nProbe sweep
 vrecall bench --target-recall 0.95
+```
+
+`bench` auto-detects the index kind and metric from the collection, so the same
+command benchmarks either index type. For a **vector-graph** index there is no
+nProbe sweep and no `targetRecall` (they are ignored with a note): the graph has
+a single fixed operating point, so `--topk` is instead swept as the x-axis — each
+K runs LIMIT-K queries and reports recall@K plus latency/QPS. Ground truth and
+the query direction follow the index metric automatically (`COSINE_SIMILARITY`
+descending for cosine, `L2_DISTANCE` ascending for l2).
+
+```bash
+# Benchmark a vector-graph index (recall@K swept over the --topk values)
+vrecall bench --index vector_graph_cosine --topk 1,10,50,100 --queries 100
 ```
 
 Key flags:

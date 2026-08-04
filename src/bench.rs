@@ -34,6 +34,87 @@ struct IndexInfo {
     id: String,
 }
 
+/// Distance metric of the index under test. The vector-graph index supports
+/// cosine and l2; both the query direction and the exact ground-truth function
+/// depend on it.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Metric {
+    Cosine,
+    L2,
+}
+
+impl Metric {
+    fn parse(s: &str) -> Result<Self> {
+        match s {
+            "cosine" => Ok(Metric::Cosine),
+            "l2" => Ok(Metric::L2),
+            other => bail!(
+                "vector-graph bench supports metric cosine or l2, got '{}'",
+                other
+            ),
+        }
+    }
+
+    /// AQL approximate-search function name for this metric.
+    fn approx_fn(self) -> &'static str {
+        match self {
+            Metric::Cosine => "APPROX_NEAR_COSINE",
+            Metric::L2 => "APPROX_NEAR_L2",
+        }
+    }
+
+    /// AQL exact-distance function name for brute-force ground truth.
+    fn exact_fn(self) -> &'static str {
+        match self {
+            Metric::Cosine => "COSINE_SIMILARITY",
+            Metric::L2 => "L2_DISTANCE",
+        }
+    }
+
+    /// Sort direction that puts the nearest neighbor first: cosine similarity
+    /// descends, L2 distance ascends. (The optimizer enforces this pairing.)
+    fn sort_dir(self) -> &'static str {
+        match self {
+            Metric::Cosine => "DESC",
+            Metric::L2 => "ASC",
+        }
+    }
+
+    /// True when the score is a similarity (higher is nearer), false for a
+    /// distance (lower is nearer). Governs the sign of the score-gap column.
+    fn is_similarity(self) -> bool {
+        matches!(self, Metric::Cosine)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Metric::Cosine => "cosine",
+            Metric::L2 => "l2",
+        }
+    }
+}
+
+/// Static facts about a vector-graph index under test. It has no nLists (no
+/// training); its tunables are the Vamana build parameters maxDegree and alpha.
+struct GraphInfo {
+    count: u64,
+    dimension: u64,
+    name: String,
+    metric: Metric,
+    max_degree: u64,
+    alpha: f64,
+}
+
+/// One row of the vector-graph report: a single query topK (which drives the
+/// LIMIT and the fixed internal search-list size), with its recall and timing.
+struct GraphKResult {
+    k: usize,
+    recall: f64,
+    score_gap: Option<f64>,
+    timing: QueryTiming,
+    latency_buckets: Vec<LatencyBucket>,
+}
+
 struct NProbeResult {
     nprobe: u64,
     recall: Vec<f64>,
@@ -276,9 +357,10 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result
             .with_context(|| format!("no index named '{}' found on the collection", name))?,
         None => arr
             .iter()
-            .find(|i| i["type"].as_str() == Some("vector"))
+            .find(|i| is_vector_index(i["type"].as_str()))
             .context("no vector index found on the collection")?,
     };
+    let index_type = vec_idx["type"].as_str().unwrap_or("");
     let index_name = vec_idx["name"]
         .as_str()
         .context("index has no name field")?
@@ -287,6 +369,35 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result
         .as_str()
         .context("index has no id field")?
         .to_string();
+    let dimension = vec_idx["params"]["dimension"]
+        .as_u64()
+        .context("could not determine dimension from index definition")?;
+    let count = client.collection_count(db, coll)?;
+
+    let mut ks: Vec<usize> = args.topk.clone();
+    ks.sort_unstable();
+    ks.dedup();
+    let max_k = *ks.last().context("--topk is empty")?;
+
+    // The vector-graph index has a single fixed operating point (no nLists,
+    // nProbe, or autotune), so it takes a separate, simpler measurement path.
+    if index_type == "vector-graph" {
+        let metric = Metric::parse(
+            vec_idx["params"]["metric"]
+                .as_str()
+                .context("vector-graph index has no metric")?,
+        )?;
+        let graph = GraphInfo {
+            count,
+            dimension,
+            name: index_name,
+            metric,
+            max_degree: vec_idx["params"]["maxDegree"].as_u64().unwrap_or(0),
+            alpha: vec_idx["params"]["alpha"].as_f64().unwrap_or(0.0),
+        };
+        return run_graph_bench(client, db, coll, &args, &graph, &ks);
+    }
+
     let nlists = vec_idx["params"]["nLists"]
         .as_u64()
         .or_else(|| vec_idx["resolvedNLists"].as_u64())
@@ -299,10 +410,6 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result
                 .find_map(|s| s["resolvedNLists"].as_u64())
         })
         .context("could not determine nLists from index definition")?;
-    let dimension = vec_idx["params"]["dimension"]
-        .as_u64()
-        .context("could not determine dimension from index definition")?;
-    let count = client.collection_count(db, coll)?;
     let info = IndexInfo {
         count,
         dimension,
@@ -310,11 +417,6 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result
         name: index_name,
         id: index_id,
     };
-
-    let mut ks: Vec<usize> = args.topk.clone();
-    ks.sort_unstable();
-    ks.dedup();
-    let max_k = *ks.last().context("--topk is empty")?;
 
     if let Some(target) = args.target_recall {
         if target <= 0.0 || target > 1.0 {
@@ -343,17 +445,16 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result
     print_sample_query_and_plan(
         client,
         db,
-        coll,
         info.dimension as usize,
-        max_k,
+        &ivf_approx_query(coll, &info.name, max_k, sample_nprobe),
         &format!("nProbe: {}", sample_nprobe),
-        &info.name,
     )?;
 
+    // The IVF query path is cosine-only (APPROX_NEAR_COSINE / COSINE_SIMILARITY).
     let queries: Vec<Query> = if let Some(path) = args.gt_file.as_deref() {
-        load_gt_from_hdf5(path, &args, max_k)?
+        load_gt_from_hdf5(path, &args, max_k, Metric::Cosine)?
     } else {
-        compute_gt_from_collection(client, db, coll, &args, max_k)?
+        compute_gt_from_collection(client, db, coll, &args, max_k, Metric::Cosine)?
     };
 
     let make_client = || client.try_clone();
@@ -373,7 +474,7 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result
                     .collect();
                 let sim_loss: Vec<Option<f64>> = ks
                     .iter()
-                    .map(|&k| sim_loss_at_k(&q.truth, &approx, k))
+                    .map(|&k| sim_loss_at_k(&q.truth, &approx, k, Metric::Cosine))
                     .collect();
                 Ok((recall, sim_loss))
             })?;
@@ -429,11 +530,9 @@ fn run_target_recall(
     print_sample_query_and_plan(
         client,
         db,
-        coll,
         info.dimension as usize,
-        max_k,
+        &ivf_target_query(coll, &info.name, max_k, target),
         &format!("targetRecall: {}", target),
-        &info.name,
     )?;
 
     // The targetRecall query option resolves the probe count from the index's
@@ -451,9 +550,9 @@ fn run_target_recall(
     )?;
 
     let queries: Vec<Query> = if let Some(path) = args.gt_file.as_deref() {
-        load_gt_from_hdf5(path, args, max_k)?
+        load_gt_from_hdf5(path, args, max_k, Metric::Cosine)?
     } else {
-        compute_gt_from_collection(client, db, coll, args, max_k)?
+        compute_gt_from_collection(client, db, coll, args, max_k, Metric::Cosine)?
     };
 
     println!(
@@ -480,6 +579,187 @@ fn run_target_recall(
 
     print_target_recall_report(info, ks, target, &per_query, &timing, &latency_buckets);
     Ok(())
+}
+
+/// Benchmark a vector-graph index. It has a single fixed operating point (no
+/// nProbe sweep, no autotune), so instead of sweeping nProbe this sweeps the
+/// query topK as the x-axis: for each K it runs LIMIT-K queries (which also
+/// sets the internal search-list size) and reports recall@K and latency.
+fn run_graph_bench(
+    client: &Client,
+    db: &str,
+    coll: &str,
+    args: &BenchArgs,
+    graph: &GraphInfo,
+    ks: &[usize],
+) -> Result<()> {
+    if args.target_recall.is_some() {
+        println!(
+            "Note: --target-recall is ignored for a vector-graph index (no autotune; \
+             single fixed operating point)."
+        );
+    }
+    let max_k = *ks.last().expect("ks is non-empty (validated in run)");
+
+    print_graph_banner(args, db, coll, graph, ks);
+    print_sample_query_and_plan(
+        client,
+        db,
+        graph.dimension as usize,
+        &graph_approx_query(coll, &graph.name, graph.metric, max_k),
+        &format!("{}, single operating point", graph.metric.label()),
+    )?;
+
+    let queries: Vec<Query> = if let Some(path) = args.gt_file.as_deref() {
+        load_gt_from_hdf5(path, args, max_k, graph.metric)?
+    } else {
+        compute_gt_from_collection(client, db, coll, args, max_k, graph.metric)?
+    };
+    if queries.is_empty() {
+        bail!("no query vectors available");
+    }
+
+    let make_client = || client.try_clone();
+    let mut results: Vec<GraphKResult> = Vec::with_capacity(ks.len());
+    for &k in ks {
+        println!(
+            "\nMeasuring approx at topK={} ({})...",
+            k,
+            mode_label(args.mode, args.clients)
+        );
+        let (per_query, latencies, timing) =
+            execute_queries(&queries, args.mode, args.clients, &make_client, |c, q| {
+                let approx =
+                    run_approx_graph(c, db, coll, &q.vector, k, graph.metric, &graph.name)?;
+                let recall = recall_at_k(&q.truth, &approx, k);
+                let gap = sim_loss_at_k(&q.truth, &approx, k, graph.metric);
+                Ok::<(f64, Option<f64>), anyhow::Error>((recall, gap))
+            })?;
+        let n = per_query.len() as f64;
+        let recall_avg = per_query.iter().map(|(r, _)| r).sum::<f64>() / n;
+        let gaps: Vec<f64> = per_query.iter().filter_map(|(_, g)| *g).collect();
+        let score_gap = if gaps.is_empty() {
+            None
+        } else {
+            Some(gaps.iter().sum::<f64>() / gaps.len() as f64)
+        };
+        let per_query_recall: Vec<Vec<f64>> = per_query.iter().map(|(r, _)| vec![*r]).collect();
+        let latency_buckets = latency_bucket_recall(&latencies, &per_query_recall, 1);
+        results.push(GraphKResult {
+            k,
+            recall: recall_avg,
+            score_gap,
+            timing,
+            latency_buckets,
+        });
+    }
+
+    print_graph_report(graph, &results, args.mode, args.clients);
+    Ok(())
+}
+
+fn print_graph_banner(args: &BenchArgs, db: &str, coll: &str, graph: &GraphInfo, ks: &[usize]) {
+    let truth_source = match &args.gt_file {
+        Some(p) => format!("HDF5 file {}", p.display()),
+        None => format!(
+            "first {} docs of '{}' (brute-force {}, {} workers)",
+            args.queries,
+            coll,
+            graph.metric.exact_fn(),
+            args.gt_workers
+        ),
+    };
+    println!("================================================================");
+    println!("vrecall bench (vector-graph)");
+    println!("================================================================");
+    println!("What we're going to do:");
+    println!("  - Use existing collection '{}.{}'", db, coll);
+    println!("    - {} vectors, dim={}", graph.count, graph.dimension);
+    println!(
+        "    - vector-graph index: '{}' (metric={}, maxDegree={}, alpha={:.2})",
+        graph.name,
+        graph.metric.label(),
+        graph.max_degree,
+        graph.alpha
+    );
+    println!("  - Ground truth: {}", truth_source);
+    println!("  - Query vectors: {}", args.queries);
+    println!("  - Recall cutoffs K (swept as the x-axis): {:?}", ks);
+    println!("  - The graph index has a single fixed operating point: no nProbe");
+    println!("    sweep and no targetRecall. Each K runs LIMIT-K queries.");
+    println!("  - Measurement: {}", mode_label(args.mode, args.clients));
+    println!();
+}
+
+fn print_graph_report(
+    graph: &GraphInfo,
+    results: &[GraphKResult],
+    mode: BenchMode,
+    clients: usize,
+) {
+    println!();
+    println!("================================================================");
+    println!("Vector-graph recall report");
+    println!(
+        "  dataset:    {} vectors, dim={}",
+        graph.count, graph.dimension
+    );
+    println!(
+        "  index:      '{}' (metric={}, maxDegree={}, alpha={:.2})",
+        graph.name,
+        graph.metric.label(),
+        graph.max_degree,
+        graph.alpha
+    );
+    println!("  measured:   {}", mode_label(mode, clients));
+    println!("================================================================");
+    println!("Single fixed operating point; topK is the x-axis (larger K widens the");
+    println!("internal search list, trading latency for recall).");
+    println!();
+
+    let gap_label = if graph.metric.is_similarity() {
+        "sim_loss"
+    } else {
+        "dist_gap"
+    };
+    println!(
+        "  topK | recall@K | {:>8} | mean_ms |    p50 |    p90 |    p95 |    p99 |      QPS",
+        gap_label
+    );
+    println!("{}", "-".repeat(92));
+    for r in results {
+        let gap = match r.score_gap {
+            Some(g) => format!("{:>+8.5}", g),
+            None => format!("{:>8}", "n/a"),
+        };
+        let t = &r.timing;
+        println!(
+            " {:>5} |   {:>6.3} | {} | {:>7.1} | {:>6.1} | {:>6.1} | {:>6.1} | {:>6.1} | {:>8.1}",
+            r.k, r.recall, gap, t.mean_latency_ms, t.p50_ms, t.p90_ms, t.p95_ms, t.p99_ms, t.qps
+        );
+    }
+    match mode {
+        BenchMode::Latency => println!(
+            "\nlatency columns = isolated per-query time (ms); QPS = single-client throughput (1000/mean)."
+        ),
+        BenchMode::Qps => println!(
+            "\nlatency columns = per-query time (ms) under load; QPS = aggregate throughput across {} clients.",
+            clients
+        ),
+    }
+
+    if results.iter().any(|r| !r.latency_buckets.is_empty()) {
+        println!();
+        println!("Recall by per-query latency band (do slower queries recall worse?):");
+        for r in results {
+            if r.latency_buckets.is_empty() {
+                continue;
+            }
+            println!("topK={}:", r.k);
+            print_latency_bucket_recall(&[r.k], &r.latency_buckets);
+        }
+    }
+    println!();
 }
 
 /// Ensure the index has a persisted autotune operating-point table that
@@ -767,26 +1047,23 @@ fn print_banner(
     println!();
 }
 
+/// Print the given approx query and, when `arangosh` is reachable, its
+/// execution plan. `query` is the exact AQL the benchmark will run (built by the
+/// per-index-kind query builders), so the plan reflects the real measurement.
 fn print_sample_query_and_plan(
     client: &Client,
     db: &str,
-    coll: &str,
     dim: usize,
-    max_k: usize,
-    opts: &str,
-    index_name: &str,
+    query: &str,
+    label: &str,
 ) -> Result<()> {
-    let q = format!(
-        "FOR d IN {} OPTIONS {{indexHint: \"{}\", forceIndexHint: true}} LET sim = APPROX_NEAR_COSINE(d.vector, @qp, {{{}}}) SORT sim DESC LIMIT {} RETURN {{k: d.idx, s: sim}}",
-        coll, index_name, opts, max_k
-    );
-    println!("Sample approx query ({{{}}}, LIMIT={}):", opts, max_k);
-    println!("  {}", q);
+    println!("Sample approx query ({}):", label);
+    println!("  {}", query);
     println!();
 
     let qp: Vec<f32> = vec![0.0; dim];
     let bind_vars = serde_json::to_string(&json!({ "qp": qp })).context("serializing bindVars")?;
-    match run_arangosh_explain(client, db, &q, &bind_vars) {
+    match run_arangosh_explain(client, db, query, &bind_vars) {
         Ok(()) => {}
         Err(e) => {
             println!("(could not run arangosh explainer: {e})");
@@ -856,6 +1133,7 @@ fn compute_gt_from_collection(
     coll: &str,
     args: &BenchArgs,
     max_k: usize,
+    metric: Metric,
 ) -> Result<Vec<Query>> {
     println!(
         "\nSampling {} query vectors from collection...",
@@ -868,15 +1146,17 @@ fn compute_gt_from_collection(
         .num_threads(args.gt_workers)
         .build()?;
     println!(
-        "Computing exact top-{} ground truth ({} workers)...",
-        max_k, args.gt_workers
+        "Computing exact top-{} ground truth ({}, {} workers)...",
+        max_k,
+        metric.exact_fn(),
+        args.gt_workers
     );
     let exact_start = Instant::now();
     let queries: Vec<Query> = gt_pool.install(|| -> Result<Vec<Query>> {
         query_vectors
             .into_par_iter()
             .map(|vector| {
-                let topk = run_exact_topk(client, db, coll, &vector, max_k)?;
+                let topk = run_exact_topk(client, db, coll, &vector, max_k, metric)?;
                 let truth = topk
                     .into_iter()
                     .map(|(idx, sim)| (idx, Some(sim)))
@@ -894,7 +1174,12 @@ fn compute_gt_from_collection(
     Ok(queries)
 }
 
-fn load_gt_from_hdf5(path: &Path, args: &BenchArgs, max_k: usize) -> Result<Vec<Query>> {
+fn load_gt_from_hdf5(
+    path: &Path,
+    args: &BenchArgs,
+    max_k: usize,
+    metric: Metric,
+) -> Result<Vec<Query>> {
     println!("\nReading ground truth from {} ...", path.display());
 
     // Query vectors live in a separate file for split datasets; otherwise in
@@ -995,12 +1280,16 @@ fn load_gt_from_hdf5(path: &Path, args: &BenchArgs, max_k: usize) -> Result<Vec<
                 let id = neighbors[[i, j]] + offset;
                 let sim = scores.as_ref().map(|d| {
                     let raw = d[[i, j]];
-                    let cos = if scores_are_cosine {
-                        raw
-                    } else {
-                        angular_dist_to_cos_sim(raw)
+                    let score = match metric {
+                        // ann-benchmarks stores cosine ground truth as angular
+                        // distance (1 − cos); HotpotQA's `scores` are already
+                        // cosine similarities.
+                        Metric::Cosine if scores_are_cosine => raw,
+                        Metric::Cosine => angular_dist_to_cos_sim(raw),
+                        // Euclidean datasets store true L2 distances; used as-is.
+                        Metric::L2 => raw,
                     };
-                    cos as f64
+                    score as f64
                 });
                 (id, sim)
             })
@@ -1054,17 +1343,58 @@ fn sample_queries(client: &Client, db: &str, coll: &str, n: usize) -> Result<Vec
         .collect()
 }
 
+/// True for any index type this tool can benchmark.
+fn is_vector_index(index_type: Option<&str>) -> bool {
+    matches!(index_type, Some("vector") | Some("vector-graph"))
+}
+
+/// Exact top-k ground-truth query, metric-aware (COSINE_SIMILARITY…DESC for
+/// cosine, L2_DISTANCE…ASC for l2).
+fn exact_query(coll: &str, metric: Metric, k: usize) -> String {
+    format!(
+        "FOR d IN {coll} LET s = {func}(d.vector, @qp) SORT s {dir} LIMIT {k} RETURN {{k: d.idx, s: s}}",
+        func = metric.exact_fn(),
+        dir = metric.sort_dir()
+    )
+}
+
+/// IVF approximate query. nProbe and LIMIT are inlined so the optimizer
+/// recognizes the APPROX_NEAR_COSINE + SORT + LIMIT pattern reliably.
+fn ivf_approx_query(coll: &str, index_name: &str, k: usize, nprobe: u64) -> String {
+    format!(
+        "FOR d IN {coll} OPTIONS {{indexHint: \"{index_name}\", forceIndexHint: true}} LET sim = APPROX_NEAR_COSINE(d.vector, @qp, {{nProbe: {nprobe}}}) SORT sim DESC LIMIT {k} RETURN {{k: d.idx, s: sim}}"
+    )
+}
+
+/// IVF approximate query in targetRecall mode. targetRecall is mutually
+/// exclusive with nProbe: the server picks the probe count from the persisted
+/// autotune table that meets this recall.
+fn ivf_target_query(coll: &str, index_name: &str, k: usize, target: f64) -> String {
+    format!(
+        "FOR d IN {coll} OPTIONS {{indexHint: \"{index_name}\", forceIndexHint: true}} LET sim = APPROX_NEAR_COSINE(d.vector, @qp, {{targetRecall: {target}}}) SORT sim DESC LIMIT {k} RETURN {{k: d.idx, s: sim}}"
+    )
+}
+
+/// Vector-graph approximate query. Unlike the IVF query there is no options
+/// object — the graph index has a single fixed operating point. Metric-aware:
+/// APPROX_NEAR_COSINE…DESC for cosine, APPROX_NEAR_L2…ASC for l2.
+fn graph_approx_query(coll: &str, index_name: &str, metric: Metric, k: usize) -> String {
+    format!(
+        "FOR d IN {coll} OPTIONS {{indexHint: \"{index_name}\", forceIndexHint: true}} LET s = {func}(d.vector, @qp) SORT s {dir} LIMIT {k} RETURN {{k: d.idx, s: s}}",
+        func = metric.approx_fn(),
+        dir = metric.sort_dir()
+    )
+}
+
 fn run_exact_topk(
     client: &Client,
     db: &str,
     coll: &str,
     qp: &[f32],
     k: usize,
+    metric: Metric,
 ) -> Result<Vec<(i64, f64)>> {
-    let q = format!(
-        "FOR d IN {coll} LET sim = COSINE_SIMILARITY(d.vector, @qp) SORT sim DESC LIMIT {k} RETURN {{k: d.idx, s: sim}}"
-    );
-    let rows = client.aql(db, &q, json!({ "qp": qp }))?;
+    let rows = client.aql(db, &exact_query(coll, metric, k), json!({ "qp": qp }))?;
     extract_id_sims(rows)
 }
 
@@ -1077,11 +1407,7 @@ fn run_approx_topk(
     nprobe: u64,
     index_name: &str,
 ) -> Result<Vec<(i64, f64)>> {
-    // nProbe and LIMIT are inlined so the optimizer recognizes the
-    // APPROX_NEAR_COSINE + SORT + LIMIT pattern reliably.
-    let q = format!(
-        "FOR d IN {coll} OPTIONS {{indexHint: \"{index_name}\", forceIndexHint: true}} LET sim = APPROX_NEAR_COSINE(d.vector, @qp, {{nProbe: {nprobe}}}) SORT sim DESC LIMIT {k} RETURN {{k: d.idx, s: sim}}"
-    );
+    let q = ivf_approx_query(coll, index_name, k, nprobe);
     let rows = client.aql(db, &q, json!({ "qp": qp }))?;
     extract_id_sims(rows)
 }
@@ -1095,11 +1421,21 @@ fn run_approx_target_recall(
     target_recall: f64,
     index_name: &str,
 ) -> Result<Vec<(i64, f64)>> {
-    // targetRecall is mutually exclusive with nProbe: the server picks the
-    // probe count from the persisted autotune table that meets this recall.
-    let q = format!(
-        "FOR d IN {coll} OPTIONS {{indexHint: \"{index_name}\", forceIndexHint: true}} LET sim = APPROX_NEAR_COSINE(d.vector, @qp, {{targetRecall: {target_recall}}}) SORT sim DESC LIMIT {k} RETURN {{k: d.idx, s: sim}}"
-    );
+    let q = ivf_target_query(coll, index_name, k, target_recall);
+    let rows = client.aql(db, &q, json!({ "qp": qp }))?;
+    extract_id_sims(rows)
+}
+
+fn run_approx_graph(
+    client: &Client,
+    db: &str,
+    coll: &str,
+    qp: &[f32],
+    k: usize,
+    metric: Metric,
+    index_name: &str,
+) -> Result<Vec<(i64, f64)>> {
+    let q = graph_approx_query(coll, index_name, metric, k);
     let rows = client.aql(db, &q, json!({ "qp": qp }))?;
     extract_id_sims(rows)
 }
@@ -1134,10 +1470,17 @@ fn recall_at_k(truth: &[(i64, Option<f64>)], approx: &[(i64, f64)], k: usize) ->
     }
 }
 
-// Mean truth-sim minus mean approx-sim across the top-K. Returns None if
-// the ground-truth source didn't provide similarities (HDF5 without
-// `distances` array).
-fn sim_loss_at_k(truth: &[(i64, Option<f64>)], approx: &[(i64, f64)], k: usize) -> Option<f64> {
+// Mean score gap between the exact and approximate top-K, always ≥ 0 when the
+// approximation is imperfect: for cosine (similarity, higher is nearer) it is
+// mean truth-sim − mean approx-sim; for L2 (distance, lower is nearer) it is
+// mean approx-dist − mean truth-dist. Returns None if the ground-truth source
+// didn't provide scores (HDF5 without a `distances` array).
+fn sim_loss_at_k(
+    truth: &[(i64, Option<f64>)],
+    approx: &[(i64, f64)],
+    k: usize,
+    metric: Metric,
+) -> Option<f64> {
     let take = k.min(truth.len()).min(approx.len());
     if take == 0 {
         return None;
@@ -1153,7 +1496,13 @@ fn sim_loss_at_k(truth: &[(i64, Option<f64>)], approx: &[(i64, f64)], k: usize) 
     if count == 0 {
         return None;
     }
-    Some(truth_sum / count as f64 - approx_sum / take as f64)
+    let truth_mean = truth_sum / count as f64;
+    let approx_mean = approx_sum / take as f64;
+    Some(if metric.is_similarity() {
+        truth_mean - approx_mean
+    } else {
+        approx_mean - truth_mean
+    })
 }
 
 fn print_report(
@@ -1296,25 +1645,49 @@ mod tests {
     }
 
     #[test]
-    fn sim_loss_is_mean_truth_minus_mean_approx() {
+    fn sim_loss_cosine_is_mean_truth_minus_mean_approx() {
         let truth = vec![(1, Some(1.0)), (2, Some(0.9))];
         let approx = vec![(1, 0.95), (2, 0.85)];
-        // (1.0 + 0.9)/2 - (0.95 + 0.85)/2 = 0.95 - 0.90 = 0.05
-        approx_eq(sim_loss_at_k(&truth, &approx, 2).unwrap(), 0.05);
+        // cosine (similarity): (1.0 + 0.9)/2 - (0.95 + 0.85)/2 = 0.95 - 0.90 = 0.05
+        approx_eq(
+            sim_loss_at_k(&truth, &approx, 2, Metric::Cosine).unwrap(),
+            0.05,
+        );
+    }
+
+    #[test]
+    fn sim_loss_l2_is_mean_approx_minus_mean_truth() {
+        let truth = vec![(1, Some(0.1)), (2, Some(0.2))];
+        let approx = vec![(1, 0.3), (2, 0.4)];
+        // l2 (distance): (0.3 + 0.4)/2 - (0.1 + 0.2)/2 = 0.35 - 0.15 = 0.20
+        approx_eq(sim_loss_at_k(&truth, &approx, 2, Metric::L2).unwrap(), 0.20);
     }
 
     #[test]
     fn sim_loss_none_when_truth_similarity_missing() {
         let truth = vec![(1, Some(1.0)), (2, None)];
         let approx = vec![(1, 0.95), (2, 0.85)];
-        assert!(sim_loss_at_k(&truth, &approx, 2).is_none());
+        assert!(sim_loss_at_k(&truth, &approx, 2, Metric::Cosine).is_none());
     }
 
     #[test]
     fn sim_loss_none_for_empty_slice() {
-        assert!(sim_loss_at_k(&[], &[], 5).is_none());
+        assert!(sim_loss_at_k(&[], &[], 5, Metric::Cosine).is_none());
         let truth = vec![(1, Some(1.0))];
-        assert!(sim_loss_at_k(&truth, &[], 5).is_none());
+        assert!(sim_loss_at_k(&truth, &[], 5, Metric::Cosine).is_none());
+    }
+
+    #[test]
+    fn metric_parse_and_query_shape() {
+        assert!(Metric::parse("cosine").unwrap().is_similarity());
+        assert!(!Metric::parse("l2").unwrap().is_similarity());
+        assert!(Metric::parse("dot").is_err());
+        assert_eq!(Metric::Cosine.sort_dir(), "DESC");
+        assert_eq!(Metric::L2.sort_dir(), "ASC");
+        let q = graph_approx_query("coll", "vg", Metric::L2, 10);
+        assert!(q.contains("APPROX_NEAR_L2"));
+        assert!(q.contains("SORT s ASC"));
+        assert!(!q.contains("nProbe"));
     }
 
     #[test]

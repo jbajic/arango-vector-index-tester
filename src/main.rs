@@ -59,8 +59,26 @@ enum Cmd {
     Bench(BenchArgs),
 }
 
+/// Which kind of vector index `setup` builds.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum IndexType {
+    /// IVF (FAISS) index: trained after ingestion, tuned via nProbe/targetRecall.
+    Ivf,
+    /// Vamana/DiskANN graph index: created *before* ingestion (no training), a
+    /// single fixed operating point (no nProbe/targetRecall). Requires the
+    /// dimension to be a multiple of 32 and metric cosine or l2.
+    VectorGraph,
+}
+
 #[derive(Args)]
 pub struct SetupArgs {
+    /// Vector index kind to build. `ivf` is the FAISS IVF index (trained after
+    /// the data is ingested, swept via nProbe). `vector-graph` is the Vamana
+    /// graph index, which is created on the empty collection and populated
+    /// afterwards, needs no training, and exposes a single operating point;
+    /// its dimension must be a multiple of 32 and its metric cosine or l2.
+    #[arg(long, value_enum, default_value_t = IndexType::Ivf)]
+    pub index_type: IndexType,
     // Resolved HDF5 path; populated at runtime from --ann-dataset (a named
     // dataset is downloaded, a file path is used directly). Not a CLI flag.
     #[arg(skip)]
@@ -113,6 +131,16 @@ pub struct SetupArgs {
     /// nLists; with a placeholder, --nlists is optional.
     #[arg(long)]
     pub factory: Option<String>,
+
+    /// Vamana out-degree bound R (vector-graph index only). The server defaults
+    /// it (64) when omitted; must be in [1, 64]. Ignored for the IVF index.
+    #[arg(long)]
+    pub max_degree: Option<u32>,
+
+    /// Vamana pruning slack alpha (vector-graph index only), in [1.0, 2.0]. The
+    /// server defaults it (1.2) when omitted. Ignored for the IVF index.
+    #[arg(long)]
+    pub alpha: Option<f32>,
 
     /// Name for the created vector index. Defaults to a metric-derived name
     /// (vector_cosine / vector_l2 / vector_dot). Set this to build several
