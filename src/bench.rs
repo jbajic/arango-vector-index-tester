@@ -1176,13 +1176,9 @@ fn sim_loss_at_k(truth: &[(i64, Option<f64>)], approx: &[(i64, f64)], k: usize) 
     let mut truth_sum = 0.0;
     let mut count = 0;
     for (_, s) in truth.iter().take(take) {
-        match s {
-            Some(v) => {
-                truth_sum += v;
-                count += 1;
-            }
-            None => return None,
-        }
+        let v = (*s)?;
+        truth_sum += v;
+        count += 1;
     }
     let approx_sum: f64 = approx.iter().take(take).map(|(_, s)| s).sum();
     if count == 0 {
