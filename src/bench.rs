@@ -8,6 +8,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::client::{AsyncSubmission, Client};
+use crate::plan;
 use crate::setup::ensure_dataset;
 use crate::{BenchArgs, BenchMode};
 
@@ -232,13 +233,21 @@ impl QueryTiming {
     }
 }
 
-/// Nearest-rank percentile of ascending-sorted `sorted` (must be non-empty),
-/// with `p` in [0, 100]. Returns the sample at rank ceil(p/100 * n).
+/// Linear-interpolation percentile of ascending-sorted `sorted` (must be
+/// non-empty), with `p` in [0, 100]. This matches `numpy.percentile`'s default
+/// method, which is what ann-benchmarks uses, so p50/p90/p95/p99 line up with
+/// its published latency curves. The rank is `(p/100) * (n - 1)` and the result
+/// interpolates between the two bracketing samples.
 fn percentile(sorted: &[f64], p: f64) -> f64 {
     let n = sorted.len();
-    let rank = ((p / 100.0) * n as f64).ceil() as usize;
-    let idx = rank.clamp(1, n) - 1;
-    sorted[idx]
+    if n == 1 {
+        return sorted[0];
+    }
+    let rank = (p / 100.0) * (n - 1) as f64;
+    let lo = rank.floor() as usize;
+    let hi = rank.ceil() as usize;
+    let frac = rank - lo as f64;
+    sorted[lo] + frac * (sorted[hi] - sorted[lo])
 }
 
 /// Per-query measurement for one nProbe value: (recall@K for each K,
@@ -440,15 +449,21 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result
         );
     }
 
-    print_banner(&args, db, coll, &info, &ks, &nprobes);
-    let sample_nprobe = *nprobes.first().unwrap();
-    print_sample_query_and_plan(
-        client,
-        db,
-        info.dimension as usize,
-        &ivf_approx_query(coll, &info.name, max_k, sample_nprobe),
-        &format!("nProbe: {}", sample_nprobe),
-    )?;
+    if !args.no_plan {
+        print_banner(&args, db, coll, &info, &ks, &nprobes);
+        let sample_nprobe = *nprobes.first().unwrap();
+        print_sample_query_and_plan(
+            client,
+            db,
+            info.dimension as usize,
+            &ivf_approx_query(coll, &info.name, max_k, sample_nprobe),
+            &format!("nProbe: {}", sample_nprobe),
+        )?;
+    }
+    if !plan::confirm(args.no_plan)? {
+        println!("Aborted.");
+        return Ok(());
+    }
 
     // The IVF query path is cosine-only (APPROX_NEAR_COSINE / COSINE_SIMILARITY).
     let queries: Vec<Query> = if let Some(path) = args.gt_file.as_deref() {
@@ -503,7 +518,7 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result
         });
     }
 
-    print_report(&info, &ks, &results, args.mode, args.clients);
+    print_report(&info, &ks, &results, args.mode, args.clients, args.verbose);
     Ok(())
 }
 
@@ -526,14 +541,20 @@ fn run_target_recall(
     target: f64,
 ) -> Result<()> {
     let max_k = *ks.last().expect("ks is non-empty (validated in run)");
-    print_banner_target_recall(args, db, coll, info, ks, target);
-    print_sample_query_and_plan(
-        client,
-        db,
-        info.dimension as usize,
-        &ivf_target_query(coll, &info.name, max_k, target),
-        &format!("targetRecall: {}", target),
-    )?;
+    if !args.no_plan {
+        print_banner_target_recall(args, db, coll, info, ks, target);
+        print_sample_query_and_plan(
+            client,
+            db,
+            info.dimension as usize,
+            &ivf_target_query(coll, &info.name, max_k, target),
+            &format!("targetRecall: {}", target),
+        )?;
+    }
+    if !plan::confirm(args.no_plan)? {
+        println!("Aborted.");
+        return Ok(());
+    }
 
     // The targetRecall query option resolves the probe count from the index's
     // persisted autotune table, so the table must already cover (max_k, target)
@@ -577,7 +598,15 @@ fn run_target_recall(
     }
     let latency_buckets = latency_bucket_recall(&latencies, &per_query, ks.len());
 
-    print_target_recall_report(info, ks, target, &per_query, &timing, &latency_buckets);
+    print_target_recall_report(
+        info,
+        ks,
+        target,
+        &per_query,
+        &timing,
+        &latency_buckets,
+        args.verbose,
+    );
     Ok(())
 }
 
@@ -601,14 +630,20 @@ fn run_graph_bench(
     }
     let max_k = *ks.last().expect("ks is non-empty (validated in run)");
 
-    print_graph_banner(args, db, coll, graph, ks);
-    print_sample_query_and_plan(
-        client,
-        db,
-        graph.dimension as usize,
-        &graph_approx_query(coll, &graph.name, graph.metric, max_k),
-        &format!("{}, single operating point", graph.metric.label()),
-    )?;
+    if !args.no_plan {
+        print_graph_banner(args, db, coll, graph, ks);
+        print_sample_query_and_plan(
+            client,
+            db,
+            graph.dimension as usize,
+            &graph_approx_query(coll, &graph.name, graph.metric, max_k),
+            &format!("{}, single operating point", graph.metric.label()),
+        )?;
+    }
+    if !plan::confirm(args.no_plan)? {
+        println!("Aborted.");
+        return Ok(());
+    }
 
     let queries: Vec<Query> = if let Some(path) = args.gt_file.as_deref() {
         load_gt_from_hdf5(path, args, max_k, graph.metric)?
@@ -654,7 +689,7 @@ fn run_graph_bench(
         });
     }
 
-    print_graph_report(graph, &results, args.mode, args.clients);
+    print_graph_report(graph, &results, args.mode, args.clients, args.verbose);
     Ok(())
 }
 
@@ -696,25 +731,20 @@ fn print_graph_report(
     results: &[GraphKResult],
     mode: BenchMode,
     clients: usize,
+    verbose: bool,
 ) {
     println!();
-    println!("================================================================");
-    println!("Vector-graph recall report");
     println!(
-        "  dataset:    {} vectors, dim={}",
-        graph.count, graph.dimension
-    );
-    println!(
-        "  index:      '{}' (metric={}, maxDegree={}, alpha={:.2})",
+        "Vector-graph recall report — {} vectors, dim={}, index '{}' \
+         (metric={}, maxDegree={}, alpha={:.2}), {}",
+        graph.count,
+        graph.dimension,
         graph.name,
         graph.metric.label(),
         graph.max_degree,
-        graph.alpha
+        graph.alpha,
+        mode_label(mode, clients)
     );
-    println!("  measured:   {}", mode_label(mode, clients));
-    println!("================================================================");
-    println!("Single fixed operating point; topK is the x-axis (larger K widens the");
-    println!("internal search list, trading latency for recall).");
     println!();
 
     let gap_label = if graph.metric.is_similarity() {
@@ -738,14 +768,9 @@ fn print_graph_report(
             r.k, r.recall, gap, t.mean_latency_ms, t.p50_ms, t.p90_ms, t.p95_ms, t.p99_ms, t.qps
         );
     }
-    match mode {
-        BenchMode::Latency => println!(
-            "\nlatency columns = isolated per-query time (ms); QPS = single-client throughput (1000/mean)."
-        ),
-        BenchMode::Qps => println!(
-            "\nlatency columns = per-query time (ms) under load; QPS = aggregate throughput across {} clients.",
-            clients
-        ),
+    if !verbose {
+        println!();
+        return;
     }
 
     if results.iter().any(|r| !r.latency_buckets.is_empty()) {
@@ -945,19 +970,16 @@ fn print_target_recall_report(
     per_query: &[Vec<f64>],
     timing: &QueryTiming,
     latency_buckets: &[LatencyBucket],
+    verbose: bool,
 ) {
     let n = per_query.len();
     println!();
-    println!("================================================================");
-    println!("Target-recall report");
     println!(
-        "  dataset:      {} vectors, dim={}",
-        info.count, info.dimension
+        "Target-recall report — {} vectors, dim={}, index '{}' (nLists={}), \
+         targetRecall {:.3}, {} queries",
+        info.count, info.dimension, info.name, info.nlists, target, n
     );
-    println!("  index:        '{}' (nLists={})", info.name, info.nlists);
-    println!("  targetRecall: {:.3}", target);
-    println!("  queries:      {}", n);
-    println!("================================================================");
+    println!();
     println!("   K   | mean recall | min recall | below target | fail %");
     println!("-------|-------------|------------|--------------|--------");
     for (i, &k) in ks.iter().enumerate() {
@@ -981,10 +1003,7 @@ fn print_target_recall_report(
         timing.p99_ms,
         timing.qps
     );
-    println!(
-        "\"below target\" counts queries whose achieved recall@K fell under the requested targetRecall."
-    );
-    if !latency_buckets.is_empty() {
+    if verbose && !latency_buckets.is_empty() {
         println!();
         println!("Recall by per-query latency band (do slower queries recall worse?):");
         print_latency_bucket_recall(ks, latency_buckets);
@@ -1511,20 +1530,17 @@ fn print_report(
     results: &[NProbeResult],
     mode: BenchMode,
     clients: usize,
+    verbose: bool,
 ) {
     println!();
-    println!("================================================================");
-    println!("Cosine recall report");
     println!(
-        "  dataset:    {} vectors, dim={}",
-        info.count, info.dimension
+        "Cosine recall report — {} vectors, dim={}, index '{}' (nLists={}), {}",
+        info.count,
+        info.dimension,
+        info.name,
+        info.nlists,
+        mode_label(mode, clients)
     );
-    println!("  index:      '{}' (nLists={})", info.name, info.nlists);
-    println!("  measured:   {}", mode_label(mode, clients));
-    println!("================================================================");
-    println!("Recall vs latency tradeoff: each nProbe is one operating point (higher");
-    println!("nProbe trades latency for recall). Compare against ann-benchmarks-style");
-    println!("recall / p95-latency curves.");
     println!();
 
     let mut header = String::from("nProbe |");
@@ -1545,14 +1561,9 @@ fn print_report(
             t.mean_latency_ms, t.p50_ms, t.p90_ms, t.p95_ms, t.p99_ms, t.qps
         );
     }
-    match mode {
-        BenchMode::Latency => println!(
-            "\nlatency columns = isolated per-query time (ms); QPS = single-client throughput (1000/mean)."
-        ),
-        BenchMode::Qps => println!(
-            "\nlatency columns = per-query time (ms) under load; QPS = aggregate throughput across {} clients.",
-            clients
-        ),
+    if !verbose {
+        println!();
+        return;
     }
 
     if results.iter().any(|r| !r.latency_buckets.is_empty()) {
@@ -1603,13 +1614,16 @@ mod tests {
     }
 
     #[test]
-    fn percentile_uses_nearest_rank() {
+    fn percentile_matches_numpy_linear_interpolation() {
+        // Values verified against numpy.percentile(..., method="linear"), the
+        // method ann-benchmarks uses.
         let sorted = [10.0, 20.0, 30.0, 40.0, 50.0];
         approx_eq(percentile(&sorted, 50.0), 30.0);
         approx_eq(percentile(&sorted, 100.0), 50.0);
-        approx_eq(percentile(&sorted, 90.0), 50.0);
-        approx_eq(percentile(&sorted, 20.0), 10.0);
-        // p=0 clamps to the first sample rather than underflowing.
+        // rank = 0.90 * 4 = 3.6 -> 40 + 0.6 * (50 - 40) = 46.
+        approx_eq(percentile(&sorted, 90.0), 46.0);
+        // rank = 0.20 * 4 = 0.8 -> 10 + 0.8 * (20 - 10) = 18.
+        approx_eq(percentile(&sorted, 20.0), 18.0);
         approx_eq(percentile(&sorted, 0.0), 10.0);
     }
 

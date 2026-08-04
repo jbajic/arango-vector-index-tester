@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 mod bench;
 mod client;
+mod plan;
 mod setup;
 
 #[derive(Parser)]
@@ -46,6 +47,16 @@ struct Cli {
         global = true
     )]
     coll: String,
+
+    /// Skip the plan preview and its confirmation prompt; run immediately.
+    /// Use this for non-interactive runs (scripts, CI).
+    #[arg(long, global = true)]
+    pub no_plan: bool,
+
+    /// Show extra per-query breakdowns in the report (recall by latency band
+    /// and, for the IVF sweep, the similarity-loss table). Off by default.
+    #[arg(long, global = true)]
+    pub verbose: bool,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -170,6 +181,11 @@ pub struct SetupArgs {
     /// How long to wait for the index to reach the ready state, in seconds.
     #[arg(long, default_value_t = 1800)]
     pub index_timeout_sec: u64,
+
+    // Mirrors the global --no-plan flag; populated from Cli at dispatch. Not a
+    // CLI flag on this struct.
+    #[arg(skip)]
+    pub no_plan: bool,
 }
 
 /// How the approx query measurement is driven.
@@ -278,13 +294,27 @@ pub struct BenchArgs {
     /// multiple vector indexes and you want to target a specific one.
     #[arg(long)]
     pub index: Option<String>,
+
+    // Mirror the global --no-plan / --verbose flags; populated from Cli at
+    // dispatch. Not CLI flags on this struct.
+    #[arg(skip)]
+    pub no_plan: bool,
+    #[arg(skip)]
+    pub verbose: bool,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let client = client::Client::new(&cli.endpoint, &cli.user, &cli.password)?;
     match cli.cmd {
-        Cmd::Setup(args) => setup::run(&client, &cli.db, &cli.coll, args),
-        Cmd::Bench(args) => bench::run(&client, &cli.db, &cli.coll, args),
+        Cmd::Setup(mut args) => {
+            args.no_plan = cli.no_plan;
+            setup::run(&client, &cli.db, &cli.coll, args)
+        }
+        Cmd::Bench(mut args) => {
+            args.no_plan = cli.no_plan;
+            args.verbose = cli.verbose;
+            bench::run(&client, &cli.db, &cli.coll, args)
+        }
     }
 }

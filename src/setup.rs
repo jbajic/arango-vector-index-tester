@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::client::Client;
+use crate::plan;
 use crate::{IndexType, SetupArgs};
 
 const DEFAULT_RANDOM_NDOCS: usize = 200_000;
@@ -192,16 +193,38 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: SetupArgs) -> Result
             Some(path) => open_vector_dataset(path)?.dim,
             None => args.dim,
         };
+        if !args.no_plan {
+            let kind = match args.index_type {
+                IndexType::Ivf => "IVF",
+                IndexType::VectorGraph => "vector-graph",
+            };
+            println!("vrecall setup (index only)");
+            println!(
+                "  - (Re)create {} vector index '{}' on collection '{}' (metric={}, dim={})",
+                kind, idx_name, coll, metric, dim
+            );
+        }
+        if !plan::confirm(args.no_plan)? {
+            println!("Aborted.");
+            return Ok(());
+        }
         create_index(client, db, coll, &args, dim, metric, &idx_name)?;
         print_index_stats(client, db, coll, &idx_name)?;
         return Ok(());
     }
 
-    print_banner(&args, db, coll, metric, &idx_name);
+    if !args.no_plan {
+        print_banner(&args, db, coll, metric, &idx_name);
+    }
 
     // Validate the HDF5 input before any destructive op on the database.
     if let Some(path) = args.input.as_deref() {
         open_vector_dataset(path)?;
+    }
+
+    if !plan::confirm(args.no_plan)? {
+        println!("Aborted.");
+        return Ok(());
     }
 
     // Drop and recreate only the target collection, leaving any sibling
