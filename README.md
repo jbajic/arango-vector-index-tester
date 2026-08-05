@@ -49,7 +49,7 @@ Both commands print a short plan and ask for confirmation before running. Run
   depend on `--index-type`. `ivf`: `nLists` (server auto-selects when unset),
   `factory` (FAISS `index_factory` string; a non-templated one needs a matching
   `nLists`). `vector-graph`: `alpha` (`[1.0, 2.0]`, default 1.2), `maxDegree`
-  (`[1, 64]`, default 64). Unknown or out-of-range values are rejected before
+  (`>= 1`, default 64). Unknown or out-of-range values are rejected before
   anything is created; omitted params fall back to the server default.
 - **Connection**: `--endpoint`, `--user`, `--password`, `--db`, `--coll` (or the
   matching `VRECALL_*` env vars).

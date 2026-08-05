@@ -1319,8 +1319,9 @@ mod tests {
     fn validate_params_range_checks_and_types() {
         assert!(validate_params(IndexType::VectorGraph, &kv(&[("alpha", "9")])).is_err());
         assert!(validate_params(IndexType::VectorGraph, &kv(&[("alpha", "0.5")])).is_err());
+        // maxDegree has a floor of 1 but no upper limit.
         assert!(validate_params(IndexType::VectorGraph, &kv(&[("maxDegree", "0")])).is_err());
-        assert!(validate_params(IndexType::VectorGraph, &kv(&[("maxDegree", "65")])).is_err());
+        assert!(validate_params(IndexType::VectorGraph, &kv(&[("maxDegree", "512")])).is_ok());
         // Wrong type for a numeric param.
         assert!(validate_params(IndexType::VectorGraph, &kv(&[("alpha", "high")])).is_err());
         // In-range values coerce to the expected JSON types.
@@ -1364,9 +1365,10 @@ mod tests {
                 assert!(help.contains(spec.key), "help omits '{}'", spec.key);
             }
         }
-        // Numeric ranges and documented defaults are rendered.
+        // Bounded ranges and documented defaults are rendered; maxDegree has no
+        // upper bound, so it shows its default but no range.
         assert!(help.contains("[1.0, 2.0]") && help.contains("server default 1.2"));
-        assert!(help.contains("[1, 64]") && help.contains("server default 64"));
+        assert!(help.contains("maxDegree") && help.contains("server default 64"));
     }
 
     #[test]
