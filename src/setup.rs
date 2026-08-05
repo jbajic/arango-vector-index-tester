@@ -76,7 +76,10 @@ const VECTOR_GRAPH_PARAMS: &[ParamSpec] = &[
     },
     ParamSpec {
         key: "maxDegree",
-        kind: ParamKind::U64 { min: 1, max: 64 },
+        kind: ParamKind::U64 {
+            min: 1,
+            max: u64::MAX,
+        },
         default: Some("64"),
         help: "Vamana out-degree bound R",
     },
@@ -169,6 +172,11 @@ fn coerce_value(spec: &ParamSpec, raw: &str) -> Result<Value> {
                 .parse()
                 .with_context(|| format!("param '{}' expects an integer", spec.key))?;
             if n < min || n > max {
+                // An unbounded upper limit would print u64::MAX, so phrase it as
+                // a lower bound instead.
+                if max == u64::MAX {
+                    bail!("param '{}' must be >= {}, got {}", spec.key, min, n);
+                }
                 bail!(
                     "param '{}' must be in [{}, {}], got {}",
                     spec.key,
