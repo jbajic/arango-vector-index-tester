@@ -1,11 +1,21 @@
 use anyhow::Result;
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 mod bench;
 mod client;
 mod plan;
 mod setup;
+
+/// Parse a `KEY=VALUE` argument, splitting on the first `=` so values may
+/// themselves contain `=`. The value is kept as a raw string; type coercion
+/// and range checking happen later against the index type's param schema.
+fn parse_kv(s: &str) -> Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((k, v)) if !k.is_empty() => Ok((k.to_string(), v.to_string())),
+        _ => Err(format!("expected KEY=VALUE, got '{}'", s)),
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -127,37 +137,17 @@ pub struct SetupArgs {
     #[arg(long)]
     pub ndocs: Option<usize>,
 
-    /// IVF nLists. If omitted, ArangoDB picks one automatically (auto-sqrt
-    /// based on document count). Required with a non-templated --factory (must
-    /// equal the factory's nlist); optional with a templated factory, where the
-    /// server fills the `{}` placeholder with the resolved nLists.
-    #[arg(long)]
-    pub nlists: Option<u64>,
-
-    /// FAISS index_factory string passed to the server (e.g.
-    /// "IVF4096_HNSW32,PQ32x8"). Must resolve to an IVF index. Omit the
-    /// dimension prefix and the metric (both come from the index params). Use a
-    /// concrete nlist with a matching --nlists, or write a `{}` placeholder
-    /// (e.g. "IVF{}_HNSW32,PQ32x8") to let the server substitute the resolved
-    /// nLists; with a placeholder, --nlists is optional.
-    #[arg(long)]
-    pub factory: Option<String>,
-
-    /// Vamana out-degree bound R (vector-graph index only). The server defaults
-    /// it (64) when omitted; must be in [1, 64]. Ignored for the IVF index.
-    #[arg(long)]
-    pub max_degree: Option<u32>,
-
-    /// Vamana pruning slack alpha (vector-graph index only), in [1.0, 2.0]. The
-    /// server defaults it (1.2) when omitted. Ignored for the IVF index.
-    #[arg(long)]
-    pub alpha: Option<f32>,
+    /// Index tuning parameter, repeatable: `--set alpha=1.4 --set maxDegree=48`.
+    /// See --help for the keys valid for each --index-type.
+    // The long help (the per-index-type key list) is generated from the param
+    // schema and injected in `main`, so it can never drift from what validates.
+    #[arg(long = "set", value_parser = parse_kv, value_name = "KEY=VALUE")]
+    pub params: Vec<(String, String)>,
 
     /// Name for the created vector index. Defaults to a metric-derived name
     /// (vector_cosine / vector_l2 / vector_dot). Set this to build several
     /// indexes on one collection: load the data once, then re-run with
-    /// --only-vector and a distinct --index-name (and --factory/--nlists) per
-    /// index.
+    /// --only-vector and a distinct --index-name (and --set params) per index.
     #[arg(long)]
     pub index_name: Option<String>,
 
@@ -304,7 +294,12 @@ pub struct BenchArgs {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    // Inject the `--set` long help generated from the param schema, so the key
+    // list in `--help` stays in lockstep with what `validate_params` accepts.
+    let cmd = Cli::command().mut_subcommand("setup", |s| {
+        s.mut_arg("params", |a| a.long_help(setup::params_help()))
+    });
+    let cli = Cli::from_arg_matches(&cmd.get_matches())?;
     let client = client::Client::new(&cli.endpoint, &cli.user, &cli.password)?;
     match cli.cmd {
         Cmd::Setup(mut args) => {

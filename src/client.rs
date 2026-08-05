@@ -43,18 +43,6 @@ impl Client {
         Client::new(&self.endpoint, &self.user, &self.password)
     }
 
-    pub fn endpoint(&self) -> &str {
-        &self.endpoint
-    }
-
-    pub fn user(&self) -> &str {
-        &self.user
-    }
-
-    pub fn password(&self) -> &str {
-        &self.password
-    }
-
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.endpoint, path)
     }

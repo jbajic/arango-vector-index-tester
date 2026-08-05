@@ -9,8 +9,8 @@ sweeping `nProbe` or by driving the index autotune `targetRecall` feature.
 
 - Rust toolchain (stable, 1.75+)
 - A running ArangoDB instance (≥ 3.12 with vector index support)
-- *(Optional)* `arangosh` on `PATH` for query-plan output; internet access to
-  download ann-benchmarks datasets (cached in `~/dataset-embeddings/`)
+- *(Optional)* internet access to download ann-benchmarks datasets (cached in
+  `~/dataset-embeddings/`)
 
 ## Build
 
@@ -23,6 +23,10 @@ cargo build --release   # binary: target/release/vrecall
 ```bash
 # 1. Load a dataset and build an index (drops & recreates the collection)
 vrecall setup --ann-dataset glove-100-angular
+
+# ... or a vector-graph index with tuned params
+vrecall setup --ann-dataset glove-100-angular \
+    --index-type vector-graph --set alpha=1.4 --set maxDegree=48
 
 # 2. Benchmark it
 vrecall bench --ann-dataset glove-100-angular --queries 100
@@ -41,6 +45,12 @@ Both commands print a short plan and ask for confirmation before running. Run
   ingestion, swept via `nProbe`/`targetRecall`) or `vector-graph`
   (Vamana/DiskANN, single fixed operating point — `bench` sweeps `--topk`
   instead). `bench` auto-detects the kind and metric from the collection.
+- **Index tuning** (`--set key=value`, repeatable, `setup`): the valid keys
+  depend on `--index-type`. `ivf`: `nLists` (server auto-selects when unset),
+  `factory` (FAISS `index_factory` string; a non-templated one needs a matching
+  `nLists`). `vector-graph`: `alpha` (`[1.0, 2.0]`, default 1.2), `maxDegree`
+  (`[1, 64]`, default 64). Unknown or out-of-range values are rejected before
+  anything is created; omitted params fall back to the server default.
 - **Connection**: `--endpoint`, `--user`, `--password`, `--db`, `--coll` (or the
   matching `VRECALL_*` env vars).
 - **Global flags**: `--no-plan` skips the plan preview and confirmation (for

@@ -6,6 +6,7 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::Uniform;
 use rayon::prelude::*;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,6 +24,245 @@ const DEFAULT_RANDOM_NDOCS: usize = 200_000;
 const TRAINING_ITERATIONS: u32 = 25;
 
 const ANN_BENCHMARKS_BASE_URL: &str = "http://ann-benchmarks.com";
+
+/// The value kind of an index parameter, used both to coerce the raw `--set`
+/// string into the JSON type the server expects and to range-check it.
+enum ParamKind {
+    /// Unsigned integer bounded to `[min, max]`.
+    U64 { min: u64, max: u64 },
+    /// Floating point bounded to `[min, max]`. Parsed as f64 so the JSON number
+    /// is the nearest f64 to the input (e.g. 1.4), not the wider re-encoding of
+    /// an intermediate f32 (1.399999976158142).
+    Float { min: f64, max: f64 },
+    /// Free-form string (no range).
+    Str,
+}
+
+/// One tunable index parameter: its wire name, value kind, the documented
+/// server default shown in the plan banner (None renders as "auto"), and a
+/// short help string. The schema is the single source of truth shared by CLI
+/// validation, the plan banner, and the `ensureIndex` body.
+struct ParamSpec {
+    key: &'static str,
+    kind: ParamKind,
+    default: Option<&'static str>,
+    help: &'static str,
+}
+
+const IVF_PARAMS: &[ParamSpec] = &[
+    ParamSpec {
+        key: "nLists",
+        kind: ParamKind::U64 {
+            min: 1,
+            max: u64::MAX,
+        },
+        default: None,
+        help: "number of IVF cells; server auto-selects (auto-sqrt) when unset",
+    },
+    ParamSpec {
+        key: "factory",
+        kind: ParamKind::Str,
+        default: None,
+        help: "FAISS index_factory string, e.g. \"IVF{}_HNSW32,PQ32x8\"",
+    },
+];
+
+const VECTOR_GRAPH_PARAMS: &[ParamSpec] = &[
+    ParamSpec {
+        key: "alpha",
+        kind: ParamKind::Float { min: 1.0, max: 2.0 },
+        default: Some("1.2"),
+        help: "Vamana pruning slack",
+    },
+    ParamSpec {
+        key: "maxDegree",
+        kind: ParamKind::U64 { min: 1, max: 64 },
+        default: Some("64"),
+        help: "Vamana out-degree bound R",
+    },
+];
+
+fn param_schema(index_type: IndexType) -> &'static [ParamSpec] {
+    match index_type {
+        IndexType::Ivf => IVF_PARAMS,
+        IndexType::VectorGraph => VECTOR_GRAPH_PARAMS,
+    }
+}
+
+fn find_spec(index_type: IndexType, key: &str) -> Option<&'static ParamSpec> {
+    param_schema(index_type).iter().find(|s| s.key == key)
+}
+
+/// Display a JSON scalar for the plan banner: strings without their quotes,
+/// numbers/bools verbatim. Only scalar param values ever reach this.
+fn json_scalar_str(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// The valid `--set` keys for an index type, each with its help text, for use
+/// in validation errors so a typo shows what the real keys do.
+fn valid_keys(index_type: IndexType) -> String {
+    param_schema(index_type)
+        .iter()
+        .map(|s| format!("{} ({})", s.key, s.help))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The `--set` long-help text, rendered from the param schema so `--help` lists
+/// exactly the keys `validate_params` accepts and can never drift from them.
+/// Injected into the `--set` arg's long help in `main`.
+pub fn params_help() -> String {
+    let mut out = String::from(
+        "Index tuning parameter, repeatable: `--set alpha=1.4 --set maxDegree=48`.\n\n\
+         Valid keys depend on --index-type:\n",
+    );
+    for index_type in [IndexType::VectorGraph, IndexType::Ivf] {
+        out.push_str(&format!("  {}:\n", kind_label_of(index_type)));
+        let schema = param_schema(index_type);
+        let width = schema.iter().map(|s| s.key.len()).max().unwrap_or(0);
+        for spec in schema {
+            out.push_str(&format!(
+                "    {:<width$}  {}{}\n",
+                spec.key,
+                spec.help,
+                spec_help_suffix(spec),
+                width = width
+            ));
+        }
+    }
+    out.push_str(
+        "\nValues are validated and range-checked against the index type; unknown \
+         keys are rejected. Omitted params fall back to the server default.",
+    );
+    out
+}
+
+/// The trailing " [range] (server default X)" for a param's help line, built
+/// from its kind and documented default. Empty when neither applies.
+fn spec_help_suffix(spec: &ParamSpec) -> String {
+    let range = match spec.kind {
+        // An unbounded upper limit (nLists) carries no useful range to show.
+        ParamKind::U64 { min, max } if max != u64::MAX => Some(format!("[{}, {}]", min, max)),
+        ParamKind::Float { min, max } => Some(format!("[{:.1}, {:.1}]", min, max)),
+        _ => None,
+    };
+    let default = spec.default.map(|d| format!("server default {}", d));
+    match (range, default) {
+        (Some(r), Some(d)) => format!(", {} ({})", r, d),
+        (Some(r), None) => format!(", {}", r),
+        (None, Some(d)) => format!(" ({})", d),
+        (None, None) => String::new(),
+    }
+}
+
+/// Coerce a raw `--set` value to the JSON type its schema declares, enforcing
+/// the range client-side (today the server is the only thing rejecting bad
+/// alpha/maxDegree values). Returns a clear error the user can act on.
+fn coerce_value(spec: &ParamSpec, raw: &str) -> Result<Value> {
+    match spec.kind {
+        ParamKind::U64 { min, max } => {
+            let n: u64 = raw
+                .parse()
+                .with_context(|| format!("param '{}' expects an integer", spec.key))?;
+            if n < min || n > max {
+                bail!(
+                    "param '{}' must be in [{}, {}], got {}",
+                    spec.key,
+                    min,
+                    max,
+                    n
+                );
+            }
+            Ok(json!(n))
+        }
+        ParamKind::Float { min, max } => {
+            let x: f64 = raw
+                .parse()
+                .with_context(|| format!("param '{}' expects a number", spec.key))?;
+            if x < min || x > max {
+                bail!(
+                    "param '{}' must be in [{}, {}], got {}",
+                    spec.key,
+                    min,
+                    max,
+                    x
+                );
+            }
+            Ok(json!(x))
+        }
+        ParamKind::Str => Ok(json!(raw)),
+    }
+}
+
+/// Validate the raw `--set key=value` pairs against the index type's schema and
+/// return the coerced param map. Rejects unknown keys (pointing at the other
+/// index type when the key belongs there), duplicate keys, and out-of-range or
+/// mistyped values, and enforces the IVF factory/nLists relationship.
+fn validate_params(
+    index_type: IndexType,
+    raw: &[(String, String)],
+) -> Result<BTreeMap<String, Value>> {
+    let other = match index_type {
+        IndexType::Ivf => IndexType::VectorGraph,
+        IndexType::VectorGraph => IndexType::Ivf,
+    };
+    let mut params = BTreeMap::new();
+    for (key, value) in raw {
+        let spec = match find_spec(index_type, key) {
+            Some(s) => s,
+            None => {
+                if find_spec(other, key).is_some() {
+                    bail!(
+                        "'{}' is a {}-only param; you selected --index-type {}. Valid keys: {}",
+                        key,
+                        kind_label_of(other),
+                        kind_label_of(index_type),
+                        valid_keys(index_type)
+                    );
+                }
+                bail!(
+                    "unknown --set key '{}' for --index-type {}. Valid keys: {}",
+                    key,
+                    kind_label_of(index_type),
+                    valid_keys(index_type)
+                );
+            }
+        };
+        if params
+            .insert(key.clone(), coerce_value(spec, value)?)
+            .is_some()
+        {
+            bail!("--set key '{}' given more than once", key);
+        }
+    }
+
+    // A concrete factory string bakes in its own nlist, so it needs a matching
+    // nLists; a templated factory (with `{}`) lets the server fill in the
+    // resolved nLists, so nLists stays optional there.
+    if let Some(Value::String(f)) = params.get("factory") {
+        if !f.contains("{}") && !params.contains_key("nLists") {
+            bail!(
+                "a non-templated factory requires nLists set to the factory \
+                 string's nlist; use the `{{}}` placeholder (e.g. \
+                 \"IVF{{}}_HNSW32,PQ32x8\") to let the server auto-select nLists"
+            );
+        }
+    }
+    Ok(params)
+}
+
+/// Human-readable index-type label used in `--set` validation errors; the same
+/// text `SetupPlan::kind_label` renders for the plan banner.
+fn kind_label_of(index_type: IndexType) -> &'static str {
+    match index_type {
+        IndexType::Ivf => "ivf",
+        IndexType::VectorGraph => "vector-graph",
+    }
+}
 
 fn infer_metric(dataset_name: &str) -> &'static str {
     if dataset_name.ends_with("-euclidean") {
@@ -172,14 +412,10 @@ struct SetupPlan {
     metric: &'static str,
     dim: usize,
     shards: u64,
-    // IVF-only params.
-    nlists: Option<u64>,
     training_iterations: u32,
-    factory: Option<String>,
     index_timeout_sec: u64,
-    // vector-graph-only params.
-    max_degree: Option<u32>,
-    alpha: Option<f32>,
+    // Validated, coerced index tuning params from `--set` (keys per index type).
+    params: BTreeMap<String, Value>,
     // Ingestion.
     source: IngestSource,
     ndocs: Option<usize>,
@@ -189,7 +425,13 @@ struct SetupPlan {
 }
 
 impl SetupPlan {
-    fn from_args(args: &SetupArgs, metric: &'static str, index_name: String, dim: usize) -> Self {
+    fn from_args(
+        args: &SetupArgs,
+        metric: &'static str,
+        index_name: String,
+        dim: usize,
+        params: BTreeMap<String, Value>,
+    ) -> Self {
         let source = match args.input.clone() {
             Some(p) => IngestSource::Hdf5(p),
             None => {
@@ -202,12 +444,9 @@ impl SetupPlan {
             metric,
             dim,
             shards: args.shards,
-            nlists: args.nlists,
             training_iterations: TRAINING_ITERATIONS,
-            factory: args.factory.clone(),
             index_timeout_sec: args.index_timeout_sec,
-            max_degree: args.max_degree,
-            alpha: args.alpha,
+            params,
             source,
             ndocs: args.ndocs,
             batch: args.batch,
@@ -226,24 +465,17 @@ impl SetupPlan {
         let type_str = match self.index_type {
             IndexType::Ivf => {
                 params["trainingIterations"] = json!(self.training_iterations);
-                if let Some(n) = self.nlists {
-                    params["nLists"] = json!(n);
-                }
-                if let Some(ref f) = self.factory {
-                    params["factory"] = json!(f);
-                }
                 "vector"
             }
-            IndexType::VectorGraph => {
-                if let Some(d) = self.max_degree {
-                    params["maxDegree"] = json!(d);
-                }
-                if let Some(a) = self.alpha {
-                    params["alpha"] = json!(a);
-                }
-                "vector-graph"
-            }
+            IndexType::VectorGraph => "vector-graph",
         };
+        // The validated params map is the only source of the tuning knobs, so
+        // what the banner shows is exactly what the server receives.
+        if let Value::Object(obj) = &mut params {
+            for (k, v) in &self.params {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
         json!({
             "name": self.index_name,
             "type": type_str,
@@ -260,22 +492,24 @@ impl SetupPlan {
         }
     }
 
-    fn nlists_label(&self) -> String {
-        self.nlists
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "auto".to_string())
+    /// Render each param for this index type as `key=value`, showing the
+    /// documented server default (or "auto") for keys the user did not set.
+    /// Used in the compact `create_index` "Creating ..." lines.
+    fn params_summary(&self) -> String {
+        param_schema(self.index_type)
+            .iter()
+            .map(|spec| format!("{}={}", spec.key, self.param_display(spec)))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
-    fn degree_label(&self) -> String {
-        self.max_degree
-            .map(|d| d.to_string())
-            .unwrap_or_else(|| "default".to_string())
-    }
-
-    fn alpha_label(&self) -> String {
-        self.alpha
-            .map(|a| a.to_string())
-            .unwrap_or_else(|| "default".to_string())
+    /// The value to show for one param: the set value, else the schema's
+    /// documented default, else "auto" when there is no default.
+    fn param_display(&self, spec: &ParamSpec) -> String {
+        match self.params.get(spec.key) {
+            Some(v) => json_scalar_str(v),
+            None => spec.default.unwrap_or("auto").to_string(),
+        }
     }
 
     fn source_str(&self) -> String {
@@ -337,12 +571,12 @@ impl SetupPlan {
             IndexType::Ivf => {
                 self.print_insert_step(3);
                 println!("  4. Build IVF vector index '{}':", self.index_name);
-                println!("     - type=vector, metric={}", self.metric);
                 println!(
-                    "     - nLists={}, trainingIterations={}",
-                    self.nlists_label(),
-                    self.training_iterations
+                    "     - type=vector, metric={}, dimension={}",
+                    self.metric, self.dim
                 );
+                self.print_params_block();
+                println!("     - trainingIterations={}", self.training_iterations);
                 println!(
                     "     - waits up to {}s for ready state",
                     self.index_timeout_sec
@@ -354,38 +588,46 @@ impl SetupPlan {
                     "  3. Build vector-graph index '{}' (on empty collection):",
                     self.index_name
                 );
-                println!("     - type=vector-graph, metric={}", self.metric);
                 println!(
-                    "     - maxDegree={}, alpha={} (no training)",
-                    self.degree_label(),
-                    self.alpha_label()
+                    "     - type=vector-graph, metric={}, dimension={} (no training)",
+                    self.metric, self.dim
                 );
+                self.print_params_block();
                 self.print_insert_step(4);
                 println!("     - the index is populated as documents are inserted");
             }
         }
         println!();
     }
+
+    /// List every param for this index type, aligned, marking whether each was
+    /// set via `--set` or is falling back to the documented server default.
+    fn print_params_block(&self) {
+        let schema = param_schema(self.index_type);
+        let width = schema.iter().map(|s| s.key.len()).max().unwrap_or(0);
+        println!("     - params:");
+        for spec in schema {
+            let source = if self.params.contains_key(spec.key) {
+                "set"
+            } else {
+                "server default"
+            };
+            println!(
+                "         {:<width$} = {:<6} ({})",
+                spec.key,
+                self.param_display(spec),
+                source,
+                width = width
+            );
+        }
+    }
 }
 
 pub fn run(client: &Client, db: &str, coll: &str, mut args: SetupArgs) -> Result<()> {
-    // Factory/nLists are IVF-only. A concrete factory string requires nLists to
-    // equal its nlist, so fail fast rather than letting index creation error out
-    // later. A templated factory (with a `{}` placeholder) lets the server fill
-    // in the resolved nLists, so nLists is optional there.
-    if args.index_type == IndexType::Ivf {
-        if let Some(ref factory) = args.factory {
-            if !factory.contains("{}") && args.nlists.is_none() {
-                bail!(
-                    "a non-templated --factory requires --nlists set to the factory \
-                     string's nlist; use the `{{}}` placeholder (e.g. \
-                     \"IVF{{}}_HNSW32,PQ32x8\") to let the server auto-select nLists"
-                );
-            }
-        }
-    } else if args.factory.is_some() || args.nlists.is_some() {
-        bail!("--factory and --nlists are IVF-only; the vector-graph index has no nLists/training");
-    }
+    // Validate `--set` up front (before any destructive op): reject keys that
+    // don't belong to this index type, coerce/range-check values, and enforce
+    // the IVF factory/nLists relationship.
+    let params = validate_params(args.index_type, &args.params)?;
 
     if let Some(ref name) = args.ann_dataset.clone() {
         args.input = Some(ensure_dataset(name)?);
@@ -415,7 +657,7 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: SetupArgs) -> Result
         Some(path) => open_vector_dataset(path)?.dim,
         None => args.dim,
     };
-    let plan = SetupPlan::from_args(&args, metric, idx_name.clone(), dim);
+    let plan = SetupPlan::from_args(&args, metric, idx_name.clone(), dim, params);
 
     if args.only_vector {
         if !args.no_plan {
@@ -769,19 +1011,13 @@ fn create_index(client: &Client, db: &str, coll: &str, plan: &SetupPlan) -> Resu
     let def = plan.index_definition();
     match plan.index_type {
         IndexType::Ivf => {
-            let factory_note = plan
-                .factory
-                .as_deref()
-                .map(|f| format!(", factory={}", f))
-                .unwrap_or_default();
             println!(
-                "Creating vector index '{}' (metric={}, dim={}, nLists={}, trainingIterations={}{})...",
+                "Creating vector index '{}' (metric={}, dim={}, trainingIterations={}, {})...",
                 plan.index_name,
                 plan.metric,
                 plan.dim,
-                plan.nlists_label(),
                 plan.training_iterations,
-                factory_note
+                plan.params_summary()
             );
             let start = Instant::now();
             if let Err(e) = client.create_vector_index(db, coll, &def) {
@@ -798,12 +1034,11 @@ fn create_index(client: &Client, db: &str, coll: &str, plan: &SetupPlan) -> Resu
             // for. The server enforces dimension % 32 == 0 and metric in
             // {cosine, l2}; we surface its error verbatim.
             println!(
-                "Creating vector-graph index '{}' (metric={}, dim={}, maxDegree={}, alpha={})...",
+                "Creating vector-graph index '{}' (metric={}, dim={}, {})...",
                 plan.index_name,
                 plan.metric,
                 plan.dim,
-                plan.degree_label(),
-                plan.alpha_label()
+                plan.params_summary()
             );
             let start = Instant::now();
             client.create_vector_index(db, coll, &def)?;
@@ -959,19 +1194,23 @@ pub(crate) fn is_ready(idx: &Value) -> bool {
 mod tests {
     use super::*;
 
-    fn ivf_plan() -> SetupPlan {
+    fn kv(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn plan_with(index_type: IndexType, params: BTreeMap<String, Value>) -> SetupPlan {
         SetupPlan {
-            index_type: IndexType::Ivf,
+            index_type,
             index_name: "vec".to_string(),
             metric: "l2",
             dim: 128,
             shards: 3,
-            nlists: Some(256),
             training_iterations: TRAINING_ITERATIONS,
-            factory: None,
             index_timeout_sec: 1800,
-            max_degree: None,
-            alpha: None,
+            params,
             source: IngestSource::Random(1),
             ndocs: None,
             batch: 5000,
@@ -981,10 +1220,11 @@ mod tests {
     }
 
     // The index the server builds must be exactly what the plan describes: the
-    // definition is generated from the same fields the banner renders.
+    // definition is generated from the same validated map the banner renders.
     #[test]
     fn ivf_index_definition_matches_declared_fields() {
-        let p = ivf_plan();
+        let params = validate_params(IndexType::Ivf, &kv(&[("nLists", "256")])).unwrap();
+        let p = plan_with(IndexType::Ivf, params);
         let def = p.index_definition();
         assert_eq!(def["type"], "vector");
         let params = &def["params"];
@@ -994,7 +1234,7 @@ mod tests {
             params["trainingIterations"].as_u64().unwrap() as u32,
             p.training_iterations
         );
-        assert_eq!(params["nLists"].as_u64(), p.nlists);
+        assert_eq!(params["nLists"].as_u64(), Some(256));
         // IVF must not carry graph-only params, and factory is omitted when unset.
         assert!(params.get("maxDegree").is_none());
         assert!(params.get("alpha").is_none());
@@ -1003,9 +1243,9 @@ mod tests {
 
     #[test]
     fn ivf_index_definition_includes_factory_when_set() {
-        let mut p = ivf_plan();
-        p.factory = Some("IVF{}_HNSW32,PQ32x8".to_string());
-        p.nlists = None;
+        let params =
+            validate_params(IndexType::Ivf, &kv(&[("factory", "IVF{}_HNSW32,PQ32x8")])).unwrap();
+        let p = plan_with(IndexType::Ivf, params);
         let def = p.index_definition();
         assert_eq!(def["params"]["factory"], "IVF{}_HNSW32,PQ32x8");
         assert!(def["params"].get("nLists").is_none());
@@ -1013,17 +1253,14 @@ mod tests {
 
     #[test]
     fn graph_index_definition_matches_declared_fields() {
-        let p = SetupPlan {
-            index_type: IndexType::VectorGraph,
-            index_name: "vg".to_string(),
-            metric: "cosine",
-            dim: 96,
-            nlists: None,
-            factory: None,
-            max_degree: Some(48),
-            alpha: Some(1.4),
-            ..ivf_plan()
-        };
+        let params = validate_params(
+            IndexType::VectorGraph,
+            &kv(&[("maxDegree", "48"), ("alpha", "1.4")]),
+        )
+        .unwrap();
+        let mut p = plan_with(IndexType::VectorGraph, params);
+        p.metric = "cosine";
+        p.dim = 96;
         let def = p.index_definition();
         assert_eq!(def["type"], "vector-graph");
         let params = &def["params"];
@@ -1035,6 +1272,117 @@ mod tests {
         assert!(params.get("trainingIterations").is_none());
         assert!(params.get("nLists").is_none());
         assert!(params.get("factory").is_none());
+    }
+
+    #[test]
+    fn parse_kv_splits_on_first_equals_and_requires_key() {
+        assert_eq!(
+            crate::parse_kv("alpha=1.4").unwrap(),
+            ("alpha".to_string(), "1.4".to_string())
+        );
+        // Value may itself contain '='.
+        assert_eq!(
+            crate::parse_kv("factory=IVF{}=x").unwrap(),
+            ("factory".to_string(), "IVF{}=x".to_string())
+        );
+        assert!(crate::parse_kv("noequals").is_err());
+        assert!(crate::parse_kv("=novalue").is_err());
+    }
+
+    #[test]
+    fn validate_params_rejects_unknown_key_listing_valid_ones() {
+        let err = validate_params(IndexType::VectorGraph, &kv(&[("bogus", "1")]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown --set key 'bogus'"));
+        assert!(err.contains("alpha") && err.contains("maxDegree"));
+    }
+
+    #[test]
+    fn validate_params_points_at_the_other_index_type() {
+        let err = validate_params(IndexType::VectorGraph, &kv(&[("nLists", "10")]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'nLists' is a ivf-only param"));
+        assert!(err.contains("vector-graph"));
+    }
+
+    #[test]
+    fn validate_params_range_checks_and_types() {
+        assert!(validate_params(IndexType::VectorGraph, &kv(&[("alpha", "9")])).is_err());
+        assert!(validate_params(IndexType::VectorGraph, &kv(&[("alpha", "0.5")])).is_err());
+        assert!(validate_params(IndexType::VectorGraph, &kv(&[("maxDegree", "0")])).is_err());
+        assert!(validate_params(IndexType::VectorGraph, &kv(&[("maxDegree", "65")])).is_err());
+        // Wrong type for a numeric param.
+        assert!(validate_params(IndexType::VectorGraph, &kv(&[("alpha", "high")])).is_err());
+        // In-range values coerce to the expected JSON types.
+        let ok = validate_params(
+            IndexType::VectorGraph,
+            &kv(&[("alpha", "1.5"), ("maxDegree", "32")]),
+        )
+        .unwrap();
+        assert!((ok["alpha"].as_f64().unwrap() - 1.5).abs() < 1e-6);
+        assert_eq!(ok["maxDegree"].as_u64(), Some(32));
+    }
+
+    #[test]
+    fn validate_params_rejects_duplicate_key() {
+        assert!(validate_params(
+            IndexType::VectorGraph,
+            &kv(&[("alpha", "1.3"), ("alpha", "1.4")])
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn validate_params_enforces_factory_nlists_relationship() {
+        // Non-templated factory without nLists is rejected.
+        assert!(validate_params(IndexType::Ivf, &kv(&[("factory", "IVF4096_HNSW32")])).is_err());
+        // With a matching nLists it is accepted.
+        assert!(validate_params(
+            IndexType::Ivf,
+            &kv(&[("factory", "IVF4096_HNSW32"), ("nLists", "4096")])
+        )
+        .is_ok());
+        // A templated factory lets the server pick nLists, so it stands alone.
+        assert!(validate_params(IndexType::Ivf, &kv(&[("factory", "IVF{}_HNSW32")])).is_ok());
+    }
+
+    #[test]
+    fn params_help_lists_every_schema_key_with_its_range() {
+        let help = params_help();
+        for index_type in [IndexType::Ivf, IndexType::VectorGraph] {
+            for spec in param_schema(index_type) {
+                assert!(help.contains(spec.key), "help omits '{}'", spec.key);
+            }
+        }
+        // Numeric ranges and documented defaults are rendered.
+        assert!(help.contains("[1.0, 2.0]") && help.contains("server default 1.2"));
+        assert!(help.contains("[1, 64]") && help.contains("server default 64"));
+    }
+
+    #[test]
+    fn param_display_shows_set_value_else_documented_default() {
+        // maxDegree set, alpha left to the server default.
+        let params = validate_params(IndexType::VectorGraph, &kv(&[("maxDegree", "48")])).unwrap();
+        let p = plan_with(IndexType::VectorGraph, params);
+        let alpha = param_schema(IndexType::VectorGraph)
+            .iter()
+            .find(|s| s.key == "alpha")
+            .unwrap();
+        let max_degree = param_schema(IndexType::VectorGraph)
+            .iter()
+            .find(|s| s.key == "maxDegree")
+            .unwrap();
+        assert_eq!(p.param_display(alpha), "1.2"); // documented default
+        assert_eq!(p.param_display(max_degree), "48"); // set value
+                                                       // nLists has no default, so it renders as "auto".
+        let ivf = plan_with(IndexType::Ivf, BTreeMap::new());
+        let nlists = param_schema(IndexType::Ivf)
+            .iter()
+            .find(|s| s.key == "nLists")
+            .unwrap();
+        assert_eq!(ivf.param_display(nlists), "auto");
     }
 
     #[test]

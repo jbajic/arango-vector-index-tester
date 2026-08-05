@@ -481,13 +481,10 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: BenchArgs) -> Result
     if !args.no_plan {
         print_banner(&args, db, coll, &info, &ks, &nprobes);
         let sample_nprobe = *nprobes.first().unwrap();
-        print_sample_query_and_plan(
-            client,
-            db,
-            info.dimension as usize,
+        print_sample_query(
             &ivf_approx_query(coll, &info.name, max_k, sample_nprobe, info.metric),
             &format!("nProbe: {}", sample_nprobe),
-        )?;
+        );
     }
     if !plan::confirm(args.no_plan)? {
         println!("Aborted.");
@@ -572,13 +569,10 @@ fn run_target_recall(
     let max_k = *ks.last().expect("ks is non-empty (validated in run)");
     if !args.no_plan {
         print_banner_target_recall(args, db, coll, info, ks, target);
-        print_sample_query_and_plan(
-            client,
-            db,
-            info.dimension as usize,
+        print_sample_query(
             &ivf_target_query(coll, &info.name, max_k, target, info.metric),
             &format!("targetRecall: {}", target),
-        )?;
+        );
     }
     if !plan::confirm(args.no_plan)? {
         println!("Aborted.");
@@ -661,13 +655,10 @@ fn run_graph_bench(
 
     if !args.no_plan {
         print_graph_banner(args, db, coll, graph, ks);
-        print_sample_query_and_plan(
-            client,
-            db,
-            graph.dimension as usize,
+        print_sample_query(
             &graph_approx_query(coll, &graph.name, graph.metric, max_k),
             &format!("{}, single operating point", graph.metric.label()),
-        )?;
+        );
     }
     if !plan::confirm(args.no_plan)? {
         println!("Aborted.");
@@ -1111,84 +1102,12 @@ fn print_banner(
     println!();
 }
 
-/// Print the given approx query and, when `arangosh` is reachable, its
-/// execution plan. `query` is the exact AQL the benchmark will run (built by the
-/// per-index-kind query builders), so the plan reflects the real measurement.
-fn print_sample_query_and_plan(
-    client: &Client,
-    db: &str,
-    dim: usize,
-    query: &str,
-    label: &str,
-) -> Result<()> {
+/// Print the exact approx AQL the benchmark will run (built by the
+/// per-index-kind query builders), so the sample reflects the real measurement.
+fn print_sample_query(query: &str, label: &str) {
     println!("Sample approx query ({}):", label);
     println!("  {}", query);
     println!();
-
-    let qp: Vec<f32> = vec![0.0; dim];
-    let bind_vars = serde_json::to_string(&json!({ "qp": qp })).context("serializing bindVars")?;
-    match run_arangosh_explain(client, db, query, &bind_vars) {
-        Ok(()) => {}
-        Err(e) => {
-            println!("(could not run arangosh explainer: {e})");
-            println!(
-                "  hint: ensure `arangosh` is on PATH, or pass VRECALL_ARANGOSH=/path/to/arangosh"
-            );
-            println!();
-        }
-    }
-    Ok(())
-}
-
-/// Shell out to `arangosh` and call require('@arangodb/aql/explainer').explain(...)
-/// so the printed plan is byte-for-byte what `db._explain(...)` produces in a
-/// regular arangosh session.
-fn run_arangosh_explain(
-    client: &Client,
-    db: &str,
-    query: &str,
-    bind_vars_json: &str,
-) -> Result<()> {
-    use std::process::{Command, Stdio};
-
-    let arangosh_bin = std::env::var("VRECALL_ARANGOSH").unwrap_or_else(|_| "arangosh".to_string());
-
-    let script = "\
-        const internal = require('internal');\
-        const data = {\
-            query: internal.env.VRECALL_QUERY,\
-            bindVars: JSON.parse(internal.env.VRECALL_BIND)\
-        };\
-        require('@arangodb/aql/explainer').explain(data, undefined, true);";
-
-    let status = Command::new(&arangosh_bin)
-        .arg("--server.endpoint")
-        .arg(client.endpoint())
-        .arg("--server.username")
-        .arg(client.user())
-        .arg("--server.password")
-        .arg(client.password())
-        .arg("--server.database")
-        .arg(db)
-        .arg("--server.authentication")
-        .arg(if client.password().is_empty() {
-            "false"
-        } else {
-            "true"
-        })
-        .arg("--quiet")
-        .arg("--javascript.execute-string")
-        .arg(script)
-        .env("VRECALL_QUERY", query)
-        .env("VRECALL_BIND", bind_vars_json)
-        .stdin(Stdio::null())
-        .status()
-        .with_context(|| format!("spawning {}", arangosh_bin))?;
-
-    if !status.success() {
-        bail!("arangosh exited with status {}", status);
-    }
-    Ok(())
 }
 
 fn compute_gt_from_collection(
