@@ -285,6 +285,19 @@ pub struct BenchArgs {
     #[arg(long)]
     pub index: Option<String>,
 
+    /// Search-list size (beam width) for a vector-graph query, added as
+    /// `{searchListSize: N}` to the query. Larger values explore more of the
+    /// graph, trading latency for recall. When omitted the server default is
+    /// used. Ignored for IVF indexes.
+    #[arg(long = "search-list-size")]
+    pub search_list_size: Option<usize>,
+
+    /// Rerank the graph-index candidates by full-precision distance before
+    /// returning them (vector-graph indexes only; adds `{rerank: true}` to the
+    /// query). Trades extra latency for higher recall. Ignored for IVF indexes.
+    #[arg(long)]
+    pub rerank: bool,
+
     // Mirror the global --no-plan / --verbose flags; populated from Cli at
     // dispatch. Not CLI flags on this struct.
     #[arg(skip)]

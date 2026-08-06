@@ -656,8 +656,21 @@ fn run_graph_bench(
     if !args.no_plan {
         print_graph_banner(args, db, coll, graph, ks);
         print_sample_query(
-            &graph_approx_query(coll, &graph.name, graph.metric, max_k),
-            &format!("{}, single operating point", graph.metric.label()),
+            &graph_approx_query(
+                coll,
+                &graph.name,
+                graph.metric,
+                max_k,
+                args.search_list_size,
+                args.rerank,
+            ),
+            &format!(
+                "{}, searchListSize={}, rerank={}",
+                graph.metric.label(),
+                args.search_list_size
+                    .map_or_else(|| "default".to_string(), |l| l.to_string()),
+                args.rerank
+            ),
         );
     }
     if !plan::confirm(args.no_plan)? {
@@ -682,7 +695,14 @@ fn run_graph_bench(
             k,
             mode_label(args.mode, args.clients)
         );
-        let query = graph_approx_query(coll, &graph.name, graph.metric, k);
+        let query = graph_approx_query(
+            coll,
+            &graph.name,
+            graph.metric,
+            k,
+            args.search_list_size,
+            args.rerank,
+        );
         let (per_query, latencies, timing) =
             execute_queries(&queries, args.mode, args.clients, &make_client, |c, q| {
                 let approx = run_query(c, db, &query, &q.vector)?;
@@ -740,6 +760,12 @@ fn print_graph_banner(args: &BenchArgs, db: &str, coll: &str, graph: &GraphInfo,
     println!("  - Ground truth: {}", truth_source);
     println!("  - Query vectors: {}", args.queries);
     println!("  - Recall cutoffs K (swept as the x-axis): {:?}", ks);
+    println!(
+        "  - Query options: searchListSize={}, rerank={}",
+        args.search_list_size
+            .map_or_else(|| "default".to_string(), |l| l.to_string()),
+        args.rerank
+    );
     println!("  - The graph index has a single fixed operating point: no nProbe");
     println!("    sweep and no targetRecall. Each K runs LIMIT-K queries.");
     println!("  - Measurement: {}", mode_label(args.mode, args.clients));
@@ -1366,9 +1392,32 @@ fn ivf_target_query(coll: &str, index_name: &str, k: usize, target: f64, metric:
 /// Vector-graph approximate query. Unlike the IVF query there is no options
 /// object — the graph index has a single fixed operating point. Metric-aware:
 /// APPROX_NEAR_COSINE…DESC for cosine, APPROX_NEAR_L2…ASC for l2.
-fn graph_approx_query(coll: &str, index_name: &str, metric: Metric, k: usize) -> String {
+fn graph_approx_query(
+    coll: &str,
+    index_name: &str,
+    metric: Metric,
+    k: usize,
+    search_list_size: Option<usize>,
+    rerank: bool,
+) -> String {
+    // A graph index takes its search parameters as the third APPROX argument
+    // ({searchListSize, rerank}). Include only the ones explicitly set, and omit
+    // the options object entirely when neither is, so the default query shape is
+    // unchanged.
+    let mut fields: Vec<String> = Vec::new();
+    if let Some(l) = search_list_size {
+        fields.push(format!("searchListSize: {}", l));
+    }
+    if rerank {
+        fields.push("rerank: true".to_string());
+    }
+    let opts = if fields.is_empty() {
+        String::new()
+    } else {
+        format!(", {{{}}}", fields.join(", "))
+    };
     format!(
-        "FOR d IN {coll} OPTIONS {{indexHint: \"{index_name}\", forceIndexHint: true}} LET s = {func}(d.vector, @qp) SORT s {dir} LIMIT {k} RETURN {{k: d.idx, s: s}}",
+        "FOR d IN {coll} OPTIONS {{indexHint: \"{index_name}\", forceIndexHint: true}} LET s = {func}(d.vector, @qp{opts}) SORT s {dir} LIMIT {k} RETURN {{k: d.idx, s: s}}",
         func = metric.approx_fn(),
         dir = metric.sort_dir()
     )
@@ -1646,10 +1695,20 @@ mod tests {
         assert!(Metric::parse("dot").is_err());
         assert_eq!(Metric::Cosine.sort_dir(), "DESC");
         assert_eq!(Metric::L2.sort_dir(), "ASC");
-        let q = graph_approx_query("coll", "vg", Metric::L2, 10);
+        let q = graph_approx_query("coll", "vg", Metric::L2, 10, None, false);
         assert!(q.contains("APPROX_NEAR_L2"));
         assert!(q.contains("SORT s ASC"));
         assert!(!q.contains("nProbe"));
+        // With neither option set, no search-parameters object is emitted.
+        assert!(q.contains("@qp)"));
+
+        // searchListSize and rerank appear only when explicitly requested.
+        let opts = graph_approx_query("coll", "vg", Metric::L2, 10, Some(500), true);
+        assert!(opts.contains("searchListSize: 500"));
+        assert!(opts.contains("rerank: true"));
+        let sls_only = graph_approx_query("coll", "vg", Metric::L2, 10, Some(500), false);
+        assert!(sls_only.contains("searchListSize: 500"));
+        assert!(!sls_only.contains("rerank"));
     }
 
     #[test]

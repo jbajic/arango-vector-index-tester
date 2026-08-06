@@ -18,6 +18,10 @@ use crate::{IndexType, SetupArgs};
 
 const DEFAULT_RANDOM_NDOCS: usize = 200_000;
 
+/// ANSI escapes used to flag the destructive step in the plan banner.
+const RED: &str = "\x1b[31m";
+const RESET: &str = "\x1b[0m";
+
 /// IVF training iterations. Shared by the plan banner, the "Creating index"
 /// line, and the index params actually sent to the server, so the plan can
 /// never disagree with what is built.
@@ -549,7 +553,6 @@ impl SetupPlan {
             "     - {} parallel workers, batch={}",
             self.workers, self.batch
         );
-        println!("     - each doc: {{ idx: <row>, vector: [...] }}");
     }
 
     /// Render the plan banner from these fields.
@@ -572,8 +575,9 @@ impl SetupPlan {
         println!("What we're going to do:");
         println!("  1. Ensure database '{}' exists (created if missing)", db);
         println!(
-            "  2. Drop (if exists) and recreate collection '{}' (shards={})",
-            coll, self.shards
+            "  2. {}Drop (if exists) and recreate collection '{}' (shards={}) \
+             — drops all its indexes{}",
+            RED, coll, self.shards, RESET
         );
         match self.index_type {
             IndexType::Ivf => {
