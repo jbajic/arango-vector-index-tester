@@ -18,9 +18,10 @@ python3 scripts/run_sweep.py             # run the full sweep
 ```
 
 Connection settings come from the `VRECALL_*` environment variables (or
-vrecall's own defaults). Reports are written to `sweep-results/` (git-ignored),
-one `bench_<slug>.txt` per run. Options: `--matrix FILE`, `--out DIR`,
-`--dry-run`.
+vrecall's own defaults). Reports are written to `sweep-results/` (git-ignored):
+one `bench_<slug>.txt` per bench run and one `setup_<build>.txt` per index build
+(the setup report holds the "ingest + index" build time). Options:
+`--matrix FILE`, `--out DIR`, `--dry-run`.
 
 ## Visualising the results
 
@@ -39,3 +40,15 @@ python3 -m venv .venv-viz
 
 Options: `--results DIR`, `--out FILE`. Works on a partial sweep too (the image
 is labelled PARTIAL until all runs are present).
+
+`plot_build_times.py` charts the index build time per build config (x = alpha,
+bars = maxDegree), reading the `setup_*.txt` reports:
+
+```bash
+.venv-viz/bin/python scripts/plot_build_times.py   # -> sweep-results/build_times.png
+```
+
+For a vector-graph index the graph is built during ingestion, so the "ingest +
+index" time is the build time. Options: `--results DIR`, `--out FILE`, or
+`--log FILE` to parse one combined sweep log instead (older runs that streamed
+their whole output to a log file rather than per-build `setup_*.txt`).
