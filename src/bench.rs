@@ -729,7 +729,15 @@ fn run_graph_bench(
         });
     }
 
-    print_graph_report(graph, &results, args.mode, args.clients, args.verbose);
+    print_graph_report(
+        graph,
+        &results,
+        args.mode,
+        args.clients,
+        args.search_list_size,
+        args.rerank,
+        args.verbose,
+    );
     Ok(())
 }
 
@@ -777,18 +785,22 @@ fn print_graph_report(
     results: &[GraphKResult],
     mode: BenchMode,
     clients: usize,
+    search_list_size: Option<usize>,
+    rerank: bool,
     verbose: bool,
 ) {
     println!();
     println!(
         "Vector-graph recall report — {} vectors, dim={}, index '{}' \
-         (metric={}, maxDegree={}, alpha={:.2}), {}",
+         (metric={}, maxDegree={}, alpha={:.2}), searchListSize={}, rerank={}, {}",
         graph.count,
         graph.dimension,
         graph.name,
         graph.metric.label(),
         graph.max_degree,
         graph.alpha,
+        search_list_size.map_or_else(|| "default".to_string(), |l| l.to_string()),
+        rerank,
         mode_label(mode, clients)
     );
     println!();

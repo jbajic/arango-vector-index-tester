@@ -102,6 +102,10 @@ def load_matrix(path: pathlib.Path) -> tuple[list[Build], list[BenchConfig], Fix
     return builds, bench_configs, fixed
 
 
+def build_slug(build: Build) -> str:
+    return f"a{build.alpha.replace('.', '_')}_d{build.max_degree}"
+
+
 def slug(build: Build, bench: BenchConfig) -> str:
     sls = "def" if bench.search_list_size == "default" else bench.search_list_size
     return (
@@ -181,7 +185,8 @@ def main() -> int:
         print("=" * 64, file=sys.stderr)
         print(f"Build: alpha={build.alpha} maxDegree={build.max_degree}", file=sys.stderr)
         print("=" * 64, file=sys.stderr)
-        run(setup_cmd(build, fixed), dry_run=args.dry_run)
+        setup_file = args.out / f"setup_{build_slug(build)}.txt"
+        run(setup_cmd(build, fixed), dry_run=args.dry_run, tee_to=setup_file)
         for bench in bench_configs:
             out_file = args.out / f"bench_{slug(build, bench)}.txt"
             run(bench_cmd(bench, fixed), dry_run=args.dry_run, tee_to=out_file)
