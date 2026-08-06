@@ -1,0 +1,21 @@
+# vrecall sweep matrix.
+#
+# List each axis's values ONCE; the driver (scripts/run_sweep.py) expands the
+# full cross-product. Build axes (alpha x maxDegree) each cost one index rebuild
+# (a full drop + re-ingest of the dataset); bench axes (searchListSize x rerank)
+# run against every built index. Total runs = builds x bench-configs.
+#
+# With the values below: (3 x 2) builds x (2 x 2) bench-configs = 6 builds, 24 benches.
+
+[build]
+alpha     = [1.0, 1.2, 1.5]   # Vamana alpha, in [1.0, 2.0]
+maxDegree = [39, 64]          # Vamana R (max degree), >= 1
+
+[bench]
+searchListSize = ["default", 500]   # "default" = server default, else an integer
+rerank         = [false, true]
+
+[fixed]
+dataset = "sift-128-euclidean"   # dim 128 (mult. of 32), metric l2 — valid for vector-graph
+topk    = "1,10,100"             # recall cutoffs (the graph report's x-axis)
+queries = 10000                  # query vectors per bench
