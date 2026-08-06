@@ -1,0 +1,4 @@
+# Python dependencies for the sweep scripts.
+#   run_sweep.py  — stdlib only (no packages needed)
+#   visualize.py  — needs matplotlib
+matplotlib>=3.8

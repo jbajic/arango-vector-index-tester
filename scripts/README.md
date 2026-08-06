@@ -21,3 +21,21 @@ Connection settings come from the `VRECALL_*` environment variables (or
 vrecall's own defaults). Reports are written to `sweep-results/` (git-ignored),
 one `bench_<slug>.txt` per run. Options: `--matrix FILE`, `--out DIR`,
 `--dry-run`.
+
+## Visualising the results
+
+`visualize.py` renders the reports into a single chart image — a 3×3 grid of
+grouped bars (rows = recall / QPS / latency, columns = topK, x = build config,
+bar colour = query config). It only reads the report files.
+
+It needs matplotlib (see `scripts/requirements.txt`), kept in a local venv so it
+doesn't touch system Python:
+
+```bash
+python3 -m venv .venv-viz
+.venv-viz/bin/pip install -r scripts/requirements.txt
+.venv-viz/bin/python scripts/visualize.py      # -> sweep-results/summary.png
+```
+
+Options: `--results DIR`, `--out FILE`. Works on a partial sweep too (the image
+is labelled PARTIAL until all runs are present).
