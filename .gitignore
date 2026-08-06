@@ -1,2 +1,4 @@
 /target
 /sweep-results
+/.venv-viz
+/sweep-preview.png
