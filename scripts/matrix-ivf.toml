@@ -1,0 +1,25 @@
+# vrecall IVF sweep matrix (see matrix.toml for the Vamana graph version).
+#
+# IVF's knobs differ from the graph index: the build axis is `nLists` (one index
+# rebuild each) and the operating point is `nProbe` — but a single `bench` run
+# sweeps every nProbe at once, so one bench entry emits the whole recall/latency
+# curve. Total runs = (nLists values) x (nprobes entries).
+#
+# With the values below: 1 build x 1 bench = 1 rebuild, 1 bench (the full sweep).
+
+[fixed]
+index_type  = "ivf"
+dataset     = "sift-128-euclidean"   # dim 128, metric l2
+metric      = "l2"
+topk        = "1,10,100"             # recall cutoffs
+queries     = 10000                  # query vectors per bench
+only_vector = true                   # recreate the IVF index on already-ingested
+                                     # data (no full drop + re-ingest)
+
+[build]
+nLists = [16384]                     # IVF cells; one index rebuild per value
+
+[bench]
+# Each entry is one bench run whose --nprobes value is a full sweep (the report
+# then has one row per nProbe). Add more entries only to compare distinct sweeps.
+nprobes = ["1,8,32,128,512"]
