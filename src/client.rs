@@ -131,6 +131,13 @@ impl Client {
         self.request(Method::POST, &path, Some(def))
     }
 
+    /// Flush a collection's in-memory vector-graph segments to disk. Called
+    /// after ingestion so the graph is fully persisted before benchmarking.
+    pub fn flush_vector_graph(&self, db: &str, coll: &str) -> Result<Value> {
+        let path = format!("/_db/{}/_admin/vector-graph/flush?collection={}", db, coll);
+        self.request(Method::POST, &path, None)
+    }
+
     /// Fetch the persisted autotune operating-point tables for an index.
     /// `index_id` is the full handle ("collection/id").
     pub fn get_autotune(&self, db: &str, index_id: &str) -> Result<Value> {

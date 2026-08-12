@@ -228,7 +228,7 @@ pub struct BenchArgs {
 
     /// Number of query vectors to use. In collection mode: sampled from the
     /// collection. In --gt-file mode: truncates the test set.
-    #[arg(long, default_value_t = 25)]
+    #[arg(long, default_value_t = 1000)]
     pub queries: usize,
 
     /// Top-K cutoffs to report (e.g. 1,10,100 → recall@1, @10, @100).

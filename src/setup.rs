@@ -718,6 +718,10 @@ pub fn run(client: &Client, db: &str, coll: &str, mut args: SetupArgs) -> Result
             let build = create_index(client, db, coll, &plan)?;
             let start = Instant::now();
             let inserted = insert_dataset(client, db, coll, &args)?;
+            // The graph is indexed inline during ingestion; flush its in-memory
+            // segments to disk so the build is complete before benchmarking.
+            println!("Flushing vector-graph segments to disk...");
+            client.flush_vector_graph(db, coll)?;
             (inserted, start.elapsed(), build)
         }
         IndexType::Ivf => {
