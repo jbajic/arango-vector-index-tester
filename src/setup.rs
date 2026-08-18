@@ -27,6 +27,20 @@ const RESET: &str = "\x1b[0m";
 /// never disagree with what is built.
 const TRAINING_ITERATIONS: u32 = 25;
 
+// The vector-graph index is built inline as documents stream in, so a single
+// insert batch can hold its request open far longer than a plain write. Give
+// those inserts a generous per-request timeout (the IVF path indexes after
+// ingestion and keeps the default). ~1h.
+const GRAPH_INSERT_TIMEOUT: Duration = Duration::from_secs(3600);
+
+// Timeout for a single insert batch, chosen per index type.
+fn insert_timeout(index_type: IndexType) -> Option<Duration> {
+    match index_type {
+        IndexType::VectorGraph => Some(GRAPH_INSERT_TIMEOUT),
+        IndexType::Ivf => None,
+    }
+}
+
 const ANN_BENCHMARKS_BASE_URL: &str = "http://ann-benchmarks.com";
 
 /// The value kind of an index parameter, used both to coerce the raw `--set`
@@ -874,12 +888,13 @@ fn insert_random(client: &Client, db: &str, coll: &str, args: &SetupArgs) -> Res
     let batches: Vec<(usize, usize)> = batch_ranges(ndocs, args.batch);
     let counter = AtomicU64::new(0);
     let pb_ref = &pb;
+    let timeout = insert_timeout(args.index_type);
 
     let result: Result<()> = pool.install(|| {
         batches.into_par_iter().try_for_each(|(s, e)| {
             let seed = args.seed.expect("seed resolved in run() for random mode");
             let docs = make_random_batch(s, e, args.dim, seed);
-            client.insert_docs(db, coll, &docs)?;
+            client.insert_docs(db, coll, &docs, timeout)?;
             let n = counter.fetch_add((e - s) as u64, Ordering::Relaxed) + (e - s) as u64;
             pb_ref.set_position(n);
             Ok::<_, anyhow::Error>(())
@@ -934,6 +949,7 @@ fn insert_from_hdf5(
         .build()?;
     let counter = AtomicU64::new(0);
     let pb_ref = &pb;
+    let timeout = insert_timeout(args.index_type);
     let t_insert = Instant::now();
 
     // Stream in blocks (the full array can be tens of GB); read each block
@@ -956,7 +972,7 @@ fn insert_from_hdf5(
         let result: Result<()> = pool.install(|| {
             local_batches.into_par_iter().try_for_each(|(ls, le)| {
                 let docs = make_batch_from_rows(data_ref, block_start, ls, le);
-                client.insert_docs(db, coll, &docs)?;
+                client.insert_docs(db, coll, &docs, timeout)?;
                 let cur =
                     counter_ref.fetch_add((le - ls) as u64, Ordering::Relaxed) + (le - ls) as u64;
                 pb_ref.set_position(cur);

@@ -48,6 +48,19 @@ impl Client {
     }
 
     fn request(&self, method: Method, path: &str, body: Option<&Value>) -> Result<Value> {
+        self.request_with_timeout(method, path, body, None)
+    }
+
+    /// Like `request`, but overrides the client-wide timeout for this single
+    /// call. Used for vector-graph inserts, which index each document inline and
+    /// so keep one batch request open far longer than a normal write.
+    fn request_with_timeout(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+        timeout: Option<Duration>,
+    ) -> Result<Value> {
         let url = self.url(path);
         let mut req = self
             .http
@@ -55,6 +68,9 @@ impl Client {
             .basic_auth(&self.user, Some(&self.password));
         if let Some(b) = body {
             req = req.json(b);
+        }
+        if let Some(t) = timeout {
+            req = req.timeout(t);
         }
         let resp = req.send().with_context(|| format!("{} {}", method, url))?;
         let status = resp.status();
@@ -120,9 +136,15 @@ impl Client {
             .context("missing 'count' in collection response")
     }
 
-    pub fn insert_docs(&self, db: &str, coll: &str, docs: &Value) -> Result<()> {
+    pub fn insert_docs(
+        &self,
+        db: &str,
+        coll: &str,
+        docs: &Value,
+        timeout: Option<Duration>,
+    ) -> Result<()> {
         let path = format!("/_db/{}/_api/document/{}?silent=true", db, coll);
-        self.request(Method::POST, &path, Some(docs))?;
+        self.request_with_timeout(Method::POST, &path, Some(docs), timeout)?;
         Ok(())
     }
 
