@@ -54,6 +54,8 @@ enum ParamKind {
     Float { min: f64, max: f64 },
     /// Free-form string (no range).
     Str,
+    /// Boolean flag, coerced from `true`/`false`.
+    Bool,
 }
 
 /// One tunable index parameter: its wire name, value kind, the documented
@@ -100,6 +102,18 @@ const VECTOR_GRAPH_PARAMS: &[ParamSpec] = &[
         },
         default: Some("64"),
         help: "Vamana out-degree bound R",
+    },
+    ParamSpec {
+        key: "quantization",
+        kind: ParamKind::Str,
+        default: Some("PQ32x8"),
+        help: "PQ spec 'PQ<M>x<nbits>' (or 'OPQ...' for OPQ rotation); dimension must be a multiple of M, nbits in [1, 24]",
+    },
+    ParamSpec {
+        key: "quantizedBuild",
+        kind: ParamKind::Bool,
+        default: Some("false"),
+        help: "build the graph on PQ-quantized vectors (needs quantization nbits <= 8)",
     },
 ];
 
@@ -221,6 +235,11 @@ fn coerce_value(spec: &ParamSpec, raw: &str) -> Result<Value> {
             Ok(json!(x))
         }
         ParamKind::Str => Ok(json!(raw)),
+        ParamKind::Bool => match raw {
+            "true" => Ok(json!(true)),
+            "false" => Ok(json!(false)),
+            _ => bail!("param '{}' expects true or false, got '{}'", spec.key, raw),
+        },
     }
 }
 
@@ -1287,7 +1306,12 @@ mod tests {
     fn graph_index_definition_matches_declared_fields() {
         let params = validate_params(
             IndexType::VectorGraph,
-            &kv(&[("maxDegree", "48"), ("alpha", "1.4")]),
+            &kv(&[
+                ("maxDegree", "48"),
+                ("alpha", "1.4"),
+                ("quantization", "OPQ16x8"),
+                ("quantizedBuild", "true"),
+            ]),
         )
         .unwrap();
         let mut p = plan_with(IndexType::VectorGraph, params);
@@ -1300,6 +1324,8 @@ mod tests {
         assert_eq!(params["dimension"].as_u64().unwrap() as usize, 96);
         assert_eq!(params["maxDegree"].as_u64(), Some(48));
         assert!((params["alpha"].as_f64().unwrap() - 1.4).abs() < 1e-6);
+        assert_eq!(params["quantization"], "OPQ16x8");
+        assert_eq!(params["quantizedBuild"].as_bool(), Some(true));
         // The graph index has no training/nLists/factory.
         assert!(params.get("trainingIterations").is_none());
         assert!(params.get("nLists").is_none());
@@ -1356,6 +1382,21 @@ mod tests {
         .unwrap();
         assert!((ok["alpha"].as_f64().unwrap() - 1.5).abs() < 1e-6);
         assert_eq!(ok["maxDegree"].as_u64(), Some(32));
+    }
+
+    #[test]
+    fn validate_params_coerces_bool_and_rejects_non_bool() {
+        let ok =
+            validate_params(IndexType::VectorGraph, &kv(&[("quantizedBuild", "true")])).unwrap();
+        assert_eq!(ok["quantizedBuild"].as_bool(), Some(true));
+        let ok =
+            validate_params(IndexType::VectorGraph, &kv(&[("quantizedBuild", "false")])).unwrap();
+        assert_eq!(ok["quantizedBuild"].as_bool(), Some(false));
+        // Anything that is not literally true/false is rejected.
+        assert!(validate_params(IndexType::VectorGraph, &kv(&[("quantizedBuild", "1")])).is_err());
+        assert!(
+            validate_params(IndexType::VectorGraph, &kv(&[("quantizedBuild", "yes")])).is_err()
+        );
     }
 
     #[test]

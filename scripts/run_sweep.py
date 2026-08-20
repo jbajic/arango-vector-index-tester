@@ -5,7 +5,7 @@ The matrix config (scripts/matrix.toml for the Vamana graph index, or
 scripts/matrix-ivf.toml for IVF) lists each axis's values once; this driver
 expands the full cross-product. Which axes exist depends on `[fixed].index_type`:
 
-    vector-graph (default): build = alpha x maxDegree, bench = searchListSize x
+    vector-graph (default): build = alpha x maxDegree x quantization x quantizedBuild, bench = searchListSize x
         rerank. Each build is a full index rebuild (drop + re-ingest); every
         bench-config runs against it as a separate query.
     ivf: build = nLists (one index rebuild each), bench = nprobes. A single
@@ -28,6 +28,7 @@ import argparse
 import dataclasses
 import itertools
 import pathlib
+import re
 import subprocess
 import sys
 import tomllib
@@ -111,17 +112,33 @@ def graph_jobs(cfg: dict, path: pathlib.Path, fixed: Fixed) -> list[BuildJob]:
         bench_configs.append((sls_str, rerank))
 
     jobs = []
-    for a, d in itertools.product(
-        axis(cfg, path, "build", "alpha"), axis(cfg, path, "build", "maxDegree")
+    for a, d, qz, qb in itertools.product(
+        axis(cfg, path, "build", "alpha"),
+        axis(cfg, path, "build", "maxDegree"),
+        axis(cfg, path, "build", "quantization"),
+        axis(cfg, path, "build", "quantizedBuild"),
     ):
+        if not isinstance(qb, bool):
+            fail(f"{path}: quantizedBuild values must be true/false, got {qb!r}")
+        quant = as_str(qz)
+        # The slug (and the visualiser's regex) assume the canonical PQ spec
+        # form; reject anything else up front rather than emit an unparseable slug.
+        if not re.fullmatch(r"O?PQ\d+x\d+", quant):
+            fail(
+                f"{path}: quantization must look like 'PQ<M>x<nbits>' or "
+                f"'OPQ<M>x<nbits>', got {quant!r}"
+            )
         alpha, degree = as_str(a), as_str(d)
-        bslug = f"a{alpha.replace('.', '_')}_d{degree}"
+        qbtag = "on" if qb else "off"
+        bslug = f"a{alpha.replace('.', '_')}_d{degree}_qz{quant}_qb{qbtag}"
         setup = [
             str(VRECALL), "setup",
             "--index-type", "vector-graph",
             "--ann-dataset", fixed.dataset,
             "--set", f"alpha={alpha}",
             "--set", f"maxDegree={degree}",
+            "--set", f"quantization={quant}",
+            "--set", f"quantizedBuild={'true' if qb else 'false'}",
             "--no-plan",
         ]
         benches = []

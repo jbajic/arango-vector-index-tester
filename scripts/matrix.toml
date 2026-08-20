@@ -1,15 +1,18 @@
 # vrecall sweep matrix.
 #
 # List each axis's values ONCE; the driver (scripts/run_sweep.py) expands the
-# full cross-product. Build axes (alpha x maxDegree) each cost one index rebuild
-# (a full drop + re-ingest of the dataset); bench axes (searchListSize x rerank)
-# run against every built index. Total runs = builds x bench-configs.
+# full cross-product. Build axes (alpha x maxDegree x quantization x
+# quantizedBuild) each cost one index rebuild (a full drop + re-ingest of the
+# dataset); bench axes (searchListSize x rerank) run against every built index.
+# Total runs = builds x bench-configs.
 #
-# With the values below: (3 x 2) builds x (2 x 2) bench-configs = 6 builds, 24 benches.
+# With the values below: (3 x 2 x 1 x 1) builds x (2 x 2) bench-configs = 6 builds, 24 benches.
 
 [build]
-alpha     = [1.0, 1.2, 1.5]   # Vamana alpha, in [1.0, 2.0]
-maxDegree = [39, 64]          # Vamana R (max degree), >= 1
+alpha          = [1.0, 1.2, 1.5]   # Vamana alpha, in [1.0, 2.0]
+maxDegree      = [39, 64]          # Vamana R (max degree), >= 1
+quantization   = ["PQ32x8"]        # PQ spec "PQ<M>x<nbits>" (or "OPQ..."); dimension must be a multiple of M
+quantizedBuild = [false]           # build graph on PQ-quantized vectors; add true to sweep both
 
 [bench]
 searchListSize = ["default", 500]   # "default" = server default, else an integer

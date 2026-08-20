@@ -6,7 +6,7 @@ files are never modified) and renders a 3x3 grid of grouped bar charts:
 
     rows    = metric (recall@K, QPS, mean latency ms)
     columns = topK (as found in the reports, e.g. 1 / 10 / 100)
-    x-axis  = build config  (alpha x maxDegree)
+    x-axis  = build config  (alpha x maxDegree x quantization x quantizedBuild)
     bars    = query config  (rerank x searchListSize)
 
 Requires matplotlib (see scripts/README.md for the venv setup).
@@ -47,7 +47,8 @@ SURFACE, INK, MUTED, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e6e6e3"
 METRICS = [("recall", "recall@K"), ("qps", "QPS"), ("mean_ms", "mean latency (ms)")]
 
 FNAME = re.compile(
-    r"bench_a(?P<a>[0-9_]+)_d(?P<d>\d+)_sls(?P<sls>def|\d+)_rerank(?P<r>on|off)"
+    r"bench_a(?P<a>[0-9_]+)_d(?P<d>\d+)_qz(?P<qz>O?PQ\d+x\d+)_qb(?P<qb>on|off)"
+    r"_sls(?P<sls>def|\d+)_rerank(?P<r>on|off)"
 )
 # topK | recall | dist_gap | mean_ms | p50 | p90 | p95 | p99 | QPS
 ROW = re.compile(
@@ -63,6 +64,8 @@ def parse_report(path: pathlib.Path):
     cfg = dict(
         alpha=m["a"].replace("_", "."),
         R=m["d"],
+        quant=m["qz"],
+        qbuild=m["qb"],
         sls="default" if m["sls"] == "def" else m["sls"],
         rerank=m["r"],
     )
@@ -77,10 +80,22 @@ def parse_report(path: pathlib.Path):
 
 
 def render(data, out: pathlib.Path) -> None:
-    builds = sorted({(c["alpha"], c["R"]) for c, _ in data})
-    build_label = [f"α{a}\nR{R}" for a, R in builds]
+    builds = sorted({(c["alpha"], c["R"], c["quant"], c["qbuild"]) for c, _ in data})
+    # Only surface the quantization / quantizedBuild tags on the axis when the
+    # sweep actually varies them, so the common single-value case stays uncluttered.
+    show_quant = len({q for _, _, q, _ in builds}) > 1
+    show_qbuild = len({qb for _, _, _, qb in builds}) > 1
+    build_label = [
+        f"α{a}\nR{R}"
+        + (f"\n{q}" if show_quant else "")
+        + (f"\nqb{qb}" if show_qbuild else "")
+        for a, R, q, qb in builds
+    ]
     topks = sorted({k for _, rows in data for k in rows})
-    lut = {(c["alpha"], c["R"], c["rerank"], c["sls"]): rows for c, rows in data}
+    lut = {
+        (c["alpha"], c["R"], c["quant"], c["qbuild"], c["rerank"], c["sls"]): rows
+        for c, rows in data
+    }
 
     fig, axes = plt.subplots(len(METRICS), len(topks), figsize=(14, 10), sharex=True)
     fig.patch.set_facecolor(SURFACE)
@@ -94,8 +109,8 @@ def render(data, out: pathlib.Path) -> None:
             ax.set_facecolor(SURFACE)
             for qi, q in enumerate(QUERY_ORDER):
                 xs, vals = [], []
-                for bi, (a, R) in enumerate(builds):
-                    rows = lut.get((a, R, q[0], q[1]))
+                for bi, (a, R, qz, qb) in enumerate(builds):
+                    rows = lut.get((a, R, qz, qb, q[0], q[1]))
                     if rows and k in rows:
                         xs.append(bi - group_w / 2 + bar_w * (qi + 0.5))
                         vals.append(rows[k][mkey])
@@ -128,7 +143,7 @@ def render(data, out: pathlib.Path) -> None:
         "vrecall SIFT vector-graph sweep — recall / QPS / latency by build config",
         color=INK, fontsize=13, fontweight="bold", y=1.0,
     )
-    note = f"{len(data)} runs · x = build config (alpha × maxDegree), bar color = query config"
+    note = f"{len(data)} runs · x = build config (alpha × maxDegree × quantization × quantizedBuild), bar color = query config"
     if len(data) < len(builds) * len(QUERY_ORDER):
         note = "PARTIAL — " + note
     fig.text(0.5, 0.005, note, ha="center", color=MUTED, fontsize=8.5)
